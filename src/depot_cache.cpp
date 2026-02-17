@@ -1,4 +1,4 @@
-#include "meridian/proxy/depot_cache.hpp"
+#include "p4cache/depot_cache.hpp"
 #include "meridian/storage/backend.hpp"
 #include "meridian/core/thread_pool.hpp"
 
@@ -13,7 +13,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-namespace meridian::proxy {
+namespace p4cache {
 
 namespace {
 
@@ -97,10 +97,10 @@ int sql_step_retry(sqlite3_stmt* stmt) {
 
 // --- Build backend from config ---
 
-std::unique_ptr<StorageBackend> DepotCache::build_backend(const BackendConfig& cfg) {
+std::unique_ptr<meridian::StorageBackend> DepotCache::build_backend(const BackendConfig& cfg) {
     // Map "nfs" to the "local" backend type that StorageBackendFactory expects
     std::string factory_type = (cfg.type == "nfs") ? "local" : cfg.type;
-    return StorageBackendFactory::create(factory_type, cfg.params);
+    return meridian::StorageBackendFactory::create(factory_type, cfg.params);
 }
 
 DepotCache::DepotCache(const CacheConfig& config) : config_(config) {}
@@ -167,12 +167,12 @@ std::string DepotCache::start() {
     running_ = true;
 
     // Start restore pool (used in both read-write and read-only modes)
-    restore_pool_ = std::make_unique<ThreadPool>(config_.restore_threads);
+    restore_pool_ = std::make_unique<meridian::ThreadPool>(config_.restore_threads);
 
     // Start upload coordinator (read-write mode only).
     // Single coordinator thread fetches dirty batches and dispatches to upload pool.
     if (!config_.read_only) {
-        upload_pool_ = std::make_unique<ThreadPool>(config_.upload_concurrency);
+        upload_pool_ = std::make_unique<meridian::ThreadPool>(config_.upload_concurrency);
         upload_threads_.emplace_back(&DepotCache::upload_worker_loop, this);
     }
 
@@ -983,4 +983,4 @@ void DepotCache::stats_reporter_loop() {
     }
 }
 
-}  // namespace meridian::proxy
+}  // namespace p4cache

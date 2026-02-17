@@ -14,8 +14,8 @@
 //      - Primary/secondary fallback
 //      - Stats tracking
 
-#include "meridian/proxy/cache_config.hpp"
-#include "meridian/proxy/depot_cache.hpp"
+#include "p4cache/cache_config.hpp"
+#include "p4cache/depot_cache.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -32,7 +32,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using namespace meridian::proxy;
+using namespace p4cache;
 
 // ---------------------------------------------------------------------------
 // Helpers

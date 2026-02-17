@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace meridian::proxy {
+namespace p4cache {
 
 /// Configuration for a single storage backend (S3, Azure, GCS, or NFS).
 struct BackendConfig {
@@ -76,4 +76,4 @@ struct CacheConfig {
     std::string validate() const;
 };
 
-}  // namespace meridian::proxy
+}  // namespace p4cache

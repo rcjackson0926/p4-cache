@@ -1,6 +1,6 @@
-#include "meridian/proxy/depot_watcher.hpp"
-#include "meridian/proxy/depot_cache.hpp"
-#include "meridian/proxy/cache_config.hpp"
+#include "p4cache/depot_watcher.hpp"
+#include "p4cache/depot_cache.hpp"
+#include "p4cache/cache_config.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -15,7 +15,7 @@
 
 namespace {
 volatile std::sig_atomic_t g_shutdown_requested = 0;
-meridian::proxy::DepotCache* g_cache = nullptr;
+p4cache::DepotCache* g_cache = nullptr;
 
 void signal_handler(int sig) {
     (void)sig;
@@ -51,7 +51,7 @@ void write_pid_file(const std::filesystem::path& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    auto config_opt = meridian::proxy::CacheConfig::from_args(argc, argv);
+    auto config_opt = p4cache::CacheConfig::from_args(argc, argv);
     if (!config_opt) {
         return 1;
     }
@@ -138,7 +138,7 @@ int main(int argc, char* argv[]) {
     sigaction(SIGTERM, &sa, nullptr);
 
     // Create and start the cache engine
-    meridian::proxy::DepotCache cache(config);
+    p4cache::DepotCache cache(config);
     g_cache = &cache;
 
     err = cache.start();
@@ -148,7 +148,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Create and start the depot watcher
-    meridian::proxy::DepotWatcher watcher(config.depot_path, config.read_only);
+    p4cache::DepotWatcher watcher(config.depot_path, config.read_only);
 
     if (!config.read_only) {
         watcher.set_write_callback([&cache](const std::filesystem::path& path) {

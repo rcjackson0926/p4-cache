@@ -46,9 +46,9 @@ p4-cache --depot-path /mnt/nvme/depot --primary-type s3 --primary-bucket ... --r
 - Requires `CAP_SYS_ADMIN` for fanotify: `sudo setcap cap_sys_admin+ep p4-cache`
 
 **Source files:**
-- Config: `include/meridian/proxy/cache_config.hpp`, `src/cache_config.cpp`
-- Engine: `include/meridian/proxy/depot_cache.hpp`, `src/depot_cache.cpp`
-- Watcher: `include/meridian/proxy/depot_watcher.hpp`, `src/depot_watcher.cpp`
+- Config: `include/p4cache/cache_config.hpp`, `src/cache_config.cpp`
+- Engine: `include/p4cache/depot_cache.hpp`, `src/depot_cache.cpp`
+- Watcher: `include/p4cache/depot_watcher.hpp`, `src/depot_watcher.cpp`
 - Shim: `src/shim.cpp`
 - Daemon: `src/main.cpp`
 

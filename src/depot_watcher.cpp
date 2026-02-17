@@ -1,4 +1,4 @@
-#include "meridian/proxy/depot_watcher.hpp"
+#include "p4cache/depot_watcher.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -8,7 +8,7 @@
 #include <sys/fanotify.h>
 #include <unistd.h>
 
-namespace meridian::proxy {
+namespace p4cache {
 
 DepotWatcher::DepotWatcher(const std::filesystem::path& depot_path, bool read_only)
     : depot_path_(std::filesystem::canonical(depot_path)), read_only_(read_only) {}
@@ -196,4 +196,4 @@ void DepotWatcher::event_loop() {
     }
 }
 
-}  // namespace meridian::proxy
+}  // namespace p4cache

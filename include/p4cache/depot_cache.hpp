@@ -1,7 +1,7 @@
 #pragma once
 
-#include "meridian/proxy/depot_watcher.hpp"
-#include "meridian/proxy/cache_config.hpp"
+#include "p4cache/depot_watcher.hpp"
+#include "p4cache/cache_config.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -23,7 +23,7 @@ class StorageBackend;
 class ThreadPool;
 }  // namespace meridian
 
-namespace meridian::proxy {
+namespace p4cache {
 
 /// Core depot cache engine.
 ///
@@ -156,8 +156,8 @@ private:
     std::unique_ptr<meridian::StorageBackend> secondary_;   // read-only fallback, may be null
 
     // Workers
-    std::unique_ptr<ThreadPool> upload_pool_;   // null in read-only mode
-    std::unique_ptr<ThreadPool> restore_pool_;
+    std::unique_ptr<meridian::ThreadPool> upload_pool_;   // null in read-only mode
+    std::unique_ptr<meridian::ThreadPool> restore_pool_;
 
     // Threads
     std::vector<std::thread> upload_threads_;
@@ -185,4 +185,4 @@ private:
     Stats stats_;
 };
 
-}  // namespace meridian::proxy
+}  // namespace p4cache

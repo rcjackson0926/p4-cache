@@ -5,7 +5,7 @@
 #include <functional>
 #include <thread>
 
-namespace meridian::proxy {
+namespace p4cache {
 
 /// Watches a depot directory for file system events using Linux fanotify.
 ///
@@ -73,4 +73,4 @@ private:
     Stats stats_;
 };
 
-}  // namespace meridian::proxy
+}  // namespace p4cache

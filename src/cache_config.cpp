@@ -1,4 +1,4 @@
-#include "meridian/proxy/cache_config.hpp"
+#include "p4cache/cache_config.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -6,7 +6,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 
-namespace meridian::proxy {
+namespace p4cache {
 
 // --- BackendConfig ---
 
@@ -369,4 +369,4 @@ std::string CacheConfig::validate() const {
     return {};
 }
 
-}  // namespace meridian::proxy
+}  // namespace p4cache
