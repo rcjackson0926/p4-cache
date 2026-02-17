@@ -107,6 +107,32 @@ set_target_properties(p4shim PROPERTIES
     OUTPUT_NAME "p4shim"
 )
 
+# ---- Tests ----
+
+add_executable(test-p4-cache
+    tests/test_cache.cpp
+    src/depot_cache.cpp
+    src/cache_config.cpp
+    src/depot_watcher.cpp
+)
+
+target_include_directories(test-p4-cache PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${MERIDIAN_DIR}/include
+    ${SQLITE3_INCLUDE_DIR}
+)
+
+target_link_libraries(test-p4-cache PRIVATE
+    meridian_core
+    OpenSSL::Crypto
+    OpenSSL::SSL
+    Threads::Threads
+    ZLIB::ZLIB
+    CURL::libcurl
+    nlohmann_json::nlohmann_json
+    ${SQLITE3_LIBRARY}
+)
+
 # ---- Install ----
 
 install(TARGETS p4-cache RUNTIME DESTINATION bin)
