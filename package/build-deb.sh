@@ -107,7 +107,7 @@ cat > "$PKG_DIR/DEBIAN/control" <<EOF
 Package: ${PKG_NAME}
 Version: ${VERSION}
 Architecture: ${ARCH}
-Maintainer: Perforce Engineering <support@perforce.com>
+Maintainer: RCJackson Consulting <rusty@rcjacksonconsulting.com>
 Depends: libsqlite3-0, libcurl4t64 | libcurl4, libssl3t64 | libssl3, zlib1g
 Recommends: socat
 Section: admin
