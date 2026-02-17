@@ -1,0 +1,21 @@
+# Build
+build/
+
+# Package artifacts
+*.deb
+
+# Claude Code
+.claude/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.d
