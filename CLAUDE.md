@@ -52,4 +52,8 @@ p4-cache --depot-path /mnt/nvme/depot --primary-type s3 --primary-bucket ... --r
 - Shim: `src/shim.cpp`
 - Daemon: `src/main.cpp`
 
-See `docs/p4-cache-guide.md` for full operational documentation.
+**Documentation:**
+- `docs/p4-cache-guide.md` — operations quick-reference
+- `docs/configuration.md` — complete configuration reference
+- `docs/architecture.md` — internal design and data flow
+- `docs/deployment.md` — production deployment and troubleshooting

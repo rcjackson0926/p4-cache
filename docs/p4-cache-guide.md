@@ -1,12 +1,11 @@
-# P4 Cache Guide
+# P4 Cache Operations Guide
 
-This guide documents `p4-cache` behavior and configuration.
+Quick-reference for running `p4-cache`. For full details see:
+- [Configuration Reference](configuration.md) — all CLI flags, JSON fields, environment variables
+- [Architecture](architecture.md) — design, threading, data flow, SQLite schema
+- [Deployment Guide](deployment.md) — systemd, permissions, monitoring, troubleshooting
 
-## 1. Purpose
-
-`p4-cache` provides an NVMe-backed local cache with cloud/NFS object persistence for Perforce-style depot paths. It supports S3, Azure Blob Storage, Google Cloud Storage, and NFS backends, with optional dual-backend (primary + secondary fallback) configuration.
-
-## 2. Required Arguments
+## Required Arguments
 
 ```bash
 p4-cache \
@@ -14,7 +13,7 @@ p4-cache \
   --primary-type <s3|azure|gcs|nfs>
 ```
 
-## 3. Backend Configuration
+## Backend Examples
 
 ### S3
 
@@ -27,7 +26,7 @@ p4-cache \
   --primary-region us-east-1
 ```
 
-S3 credentials: `--primary-access-key` / `--primary-secret-key` or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables.
+S3 credentials: `--primary-access-key` / `--primary-secret-key` or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars.
 
 ### Azure Blob Storage
 
@@ -51,7 +50,7 @@ p4-cache \
   --primary-credentials-file /path/to/creds.json
 ```
 
-### NFS (local/mounted filesystem)
+### NFS / Local Filesystem
 
 ```bash
 p4-cache \
@@ -72,25 +71,29 @@ p4-cache \
   --secondary-path /mnt/nfs/depot-archive
 ```
 
-The secondary backend is read-only: restores try primary first, then fall back to secondary.
+Uploads go to primary only. Restores try primary first, then secondary.
 
-## 4. Common Options
+## Common Options
 
-- `--read-only`: replica/read-only mode (no uploads)
-- `--max-cache-gb <N>`
-- `--low-watermark-gb <N>`
-- `--upload-threads <N>` / `--restore-threads <N>`
-- `--daemon`
-- `--verbose`
-- `--pid-file <path>`
-- `--log-file <path>`
-- `--stats-interval <secs>`
-- `--primary-prefix <prefix>`: key prefix (default: depot dir name)
-- `--primary-no-verify-ssl`: skip SSL verification
-- `--primary-sse`: enable server-side encryption
-- `--primary-ca-cert <path>`: CA certificate for SSL
+| Flag | Description |
+|------|-------------|
+| `--read-only` | Replica mode (no uploads, no fanotify) |
+| `--max-cache-gb <N>` | Max cache size (default: 100 GB) |
+| `--low-watermark-gb <N>` | Eviction threshold (default: 80 GB) |
+| `--upload-threads <N>` | Upload workers (default: 8) |
+| `--restore-threads <N>` | Restore workers (default: 16) |
+| `--daemon` | Fork to background |
+| `--verbose` | Log individual file operations |
+| `--pid-file <path>` | PID file for daemon mode |
+| `--log-file <path>` | Log file (append mode) |
+| `--stats-interval <secs>` | Stats logging interval (default: 60) |
+| `--config <path>` | JSON config file |
+| `--primary-prefix <prefix>` | Storage key prefix (default: depot dir name) |
+| `--primary-no-verify-ssl` | Disable SSL verification |
+| `--primary-sse` | Enable server-side encryption |
+| `--primary-ca-cert <path>` | CA certificate for SSL |
 
-## 5. JSON Configuration
+## JSON Configuration
 
 ```json
 {
@@ -110,24 +113,29 @@ The secondary backend is read-only: restores try primary first, then fall back t
 }
 ```
 
-Load with `--config <path>`.
+## LD_PRELOAD Shim
 
-## 6. LD_PRELOAD Shim
+Start P4d with the shim to enable cold-file and evicted-stub interception:
 
 ```bash
 LD_PRELOAD=/usr/local/lib/libp4shim.so P4CACHE_DEPOT=/mnt/nvme/depot \
   p4d -r /mnt/nvme/depot -p 1666 -d
 ```
 
-Environment variables:
-- `P4CACHE_DEPOT` — depot path prefix to intercept
-- `P4CACHE_SOCK` — Unix socket path to daemon (default: `<depot>/.p4cache/shim.sock`)
+| Env var | Description |
+|---------|-------------|
+| `P4CACHE_DEPOT` | Depot path to intercept |
+| `P4CACHE_SOCK` | Socket path (default: `<depot>/.p4cache/shim.sock`) |
 
-## 7. Full Example
+## Full Production Example
 
 ```bash
+# Grant fanotify capability
+sudo setcap cap_sys_admin+ep /usr/local/bin/p4-cache
+
+# Start daemon
 p4-cache \
-  --depot-path /p4/depot \
+  --depot-path /mnt/nvme/depot \
   --primary-type s3 \
   --primary-endpoint https://s3.example.com \
   --primary-bucket p4-archive \
@@ -136,11 +144,29 @@ p4-cache \
   --daemon \
   --pid-file /var/run/p4-cache.pid \
   --log-file /var/log/p4-cache.log
+
+# Start P4d with shim
+LD_PRELOAD=/usr/local/lib/libp4shim.so P4CACHE_DEPOT=/mnt/nvme/depot \
+  p4d -r /mnt/nvme/depot -p ssl:1666 -d
 ```
 
-## 8. Operational Recommendations
+## Quick Checks
 
-- Keep cache and watermark sized to real workload.
-- Use read-only mode for replica roles.
-- Watch logs and stats interval output for churn and restore/upload backlogs.
-- Use secondary backend for disaster recovery or migration scenarios.
+```bash
+# Is daemon running?
+kill -0 $(cat /var/run/p4-cache.pid) && echo OK
+
+# Test socket connectivity
+echo "FETCH test" | socat - UNIX-CONNECT:/mnt/nvme/depot/.p4cache/shim.sock
+
+# Check manifest stats
+sqlite3 /mnt/nvme/depot/.p4cache/manifest.db \
+  "SELECT state, COUNT(*), SUM(size)/1073741824.0 AS gb FROM cache_entries GROUP BY state;"
+```
+
+## Operational Recommendations
+
+- Size cache and watermarks to your working set, not total depot size.
+- Use `--read-only` for replica servers (no `CAP_SYS_ADMIN` needed).
+- Watch the periodic stats log for growing dirty counts (upload backlog) or restore failures.
+- Use a secondary backend during storage migrations to avoid downtime.
