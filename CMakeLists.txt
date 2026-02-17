@@ -56,21 +56,9 @@ else()
     message(STATUS "nlohmann/json fetched")
 endif()
 
-# ---- Meridian dependency (for StorageBackend and ThreadPool) ----
+# ---- Vendored meridian (StorageBackend + ThreadPool) ----
 
-set(MERIDIAN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../meridian" CACHE PATH "Path to meridian source tree")
-set(MERIDIAN_BUILD_DIR "${MERIDIAN_DIR}/build" CACHE PATH "Path to meridian build directory")
-
-if(NOT EXISTS "${MERIDIAN_DIR}/include/meridian/storage/backend.hpp")
-    message(FATAL_ERROR "Meridian source tree not found at ${MERIDIAN_DIR}")
-endif()
-
-# Import meridian_core as a pre-built static library
-add_library(meridian_core STATIC IMPORTED)
-set_target_properties(meridian_core PROPERTIES
-    IMPORTED_LOCATION "${MERIDIAN_BUILD_DIR}/libmeridian_core.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${MERIDIAN_DIR}/include"
-)
+set(VENDORED_MERIDIAN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/meridian")
 
 # ---- p4-cache daemon ----
 
@@ -79,16 +67,18 @@ add_executable(p4-cache
     src/depot_cache.cpp
     src/cache_config.cpp
     src/depot_watcher.cpp
+    ${VENDORED_MERIDIAN_DIR}/src/storage/backend.cpp
+    ${VENDORED_MERIDIAN_DIR}/src/storage/write_cache.cpp
+    ${VENDORED_MERIDIAN_DIR}/src/net/http.cpp
 )
 
 target_include_directories(p4-cache PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${MERIDIAN_DIR}/include
+    ${VENDORED_MERIDIAN_DIR}/include
     ${SQLITE3_INCLUDE_DIR}
 )
 
 target_link_libraries(p4-cache PRIVATE
-    meridian_core
     OpenSSL::Crypto
     OpenSSL::SSL
     Threads::Threads
@@ -114,16 +104,18 @@ add_executable(test-p4-cache
     src/depot_cache.cpp
     src/cache_config.cpp
     src/depot_watcher.cpp
+    ${VENDORED_MERIDIAN_DIR}/src/storage/backend.cpp
+    ${VENDORED_MERIDIAN_DIR}/src/storage/write_cache.cpp
+    ${VENDORED_MERIDIAN_DIR}/src/net/http.cpp
 )
 
 target_include_directories(test-p4-cache PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${MERIDIAN_DIR}/include
+    ${VENDORED_MERIDIAN_DIR}/include
     ${SQLITE3_INCLUDE_DIR}
 )
 
 target_link_libraries(test-p4-cache PRIVATE
-    meridian_core
     OpenSSL::Crypto
     OpenSSL::SSL
     Threads::Threads

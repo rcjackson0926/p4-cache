@@ -6,13 +6,13 @@
 cd build && cmake .. && make -j8
 ```
 
-Requires the meridian tree at `../meridian` (for `StorageBackend` and `ThreadPool` headers + `libmeridian_core.a`). Build meridian first: `cd ../meridian/build && cmake .. && make -j8`.
+Meridian storage/threading code is vendored under `vendor/meridian/` (no external dependency needed).
 
 ## Executables
 
 | Binary | Purpose |
 |--------|---------|
-| `p4-cache` | NVMe + multi-backend cache daemon for Perforce depots (links meridian_core) |
+| `p4-cache` | NVMe + multi-backend cache daemon for Perforce depots |
 | `libp4shim.so` | LD_PRELOAD shim for P4d cold/evicted file interception |
 
 ## P4 Cache (NVMe Depot Acceleration)

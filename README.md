@@ -33,11 +33,8 @@ Each deployment can have a **primary** backend (read-write) and an optional **se
 
 ### Build
 
-Requires the [meridian](../meridian) library. Build it first:
-
 ```bash
-cd ../meridian/build && cmake .. && make -j8
-cd ../../p4-cache/build && cmake .. && make -j8
+cd build && cmake .. && make -j8
 ```
 
 This produces:
@@ -90,5 +87,4 @@ p4-cache \
 - Linux (fanotify requires `CAP_SYS_ADMIN`)
 - C++20 compiler (GCC 11+ or Clang 14+)
 - CMake 3.20+
-- [meridian](../meridian) library (for `StorageBackend`, `ThreadPool`)
 - SQLite3, OpenSSL, zlib, libcurl, nlohmann/json
