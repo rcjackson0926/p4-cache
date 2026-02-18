@@ -373,3 +373,53 @@ On restart, the daemon will:
 ### Crash Recovery
 
 On startup, the daemon automatically resets any entries in `uploading` state back to `dirty`. This ensures no files are lost if the daemon crashes mid-upload.
+
+### Failover to a Standby Server
+
+If the primary server has a hardware problem (e.g., memory failure) but the NVMe drive is still readable, you can copy the cache to a standby server to avoid re-fetching the entire depot from backend storage.
+
+**Procedure:**
+
+1. Stop p4-cache and P4d on the failing server (if still running):
+   ```bash
+   sudo systemctl stop p4d
+   sudo systemctl stop p4-cache
+   ```
+
+2. Copy the depot directory (including `.p4cache/`) to the standby:
+   ```bash
+   rsync -aHAX /mnt/nvme/depot/ standby:/mnt/nvme/depot/
+   ```
+
+3. Start p4-cache and P4d on the standby:
+   ```bash
+   sudo systemctl start p4-cache
+   sudo systemctl start p4d
+   ```
+
+On startup, p4-cache runs crash recovery (resets `uploading` entries to `dirty`) and resumes normal operation. Clean files are recognized as already uploaded. Evicted 0-byte stubs restore on demand from the backend.
+
+**Important: copy the WAL file.** If p4-cache wasn't stopped cleanly before copying, the SQLite WAL file (`manifest.db-wal`) contains recent transactions that haven't been folded into the main database. You must copy `manifest.db`, `manifest.db-wal`, and `manifest.db-shm` together. If only `manifest.db` is copied, recent state changes are lost — those files will be re-scanned and re-uploaded, which is wasteful but not destructive.
+
+**If you can't stop p4-cache before copying**, don't rsync the manifest while the daemon is writing to it. Instead, take a consistent snapshot:
+```bash
+sqlite3 /mnt/nvme/depot/.p4cache/manifest.db ".backup /tmp/manifest-snapshot.db"
+```
+Then rsync the depot files separately and place the snapshot at `<depot>/.p4cache/manifest.db` on the standby.
+
+**If you skip the manifest entirely** and only copy the depot files, p4-cache will start with an empty manifest. `scan_untracked_files()` will mark every file on disk as dirty and re-upload it to the backend. For a large cache this means a full re-upload, but nothing breaks.
+
+### Data Durability and the Dirty Window
+
+p4-cache is a **write-back cache**: P4d writes are acknowledged at NVMe speed and uploaded to the backend asynchronously. Files in `dirty` or `uploading` state exist only on the NVMe drive and have not yet reached durable storage.
+
+**If the NVMe drive is lost**, dirty files are gone. The backend only has files that completed upload (reached `clean` state). This affects:
+
+- **Replicas** running in read-only mode against the same backend will get `NOTFOUND` for any file that was dirty on the primary when it died. The replica cannot serve those files.
+- **Perforce replication** (`p4 pull -u`) is a separate channel that transfers file content directly between P4d instances over the Perforce protocol, not through the storage backend. If a replica already pulled the file content via `p4 pull` before the primary failed, it has its own copy and is unaffected.
+
+**To minimize the dirty window:**
+
+- Tune `upload_poll_interval` (default 100ms) and `upload_batch_size` (default 64) for faster drain
+- Increase `upload_concurrency` for more parallel uploads
+- Monitor the `dirty` count in stats output — a consistently high count means uploads aren't keeping up with writes
