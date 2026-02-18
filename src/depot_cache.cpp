@@ -2,12 +2,17 @@
 #include "meridian/storage/backend.hpp"
 #include "meridian/core/thread_pool.hpp"
 
+#include <cinttypes>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <sqlite3.h>
+#include <sstream>
+#include <vector>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -93,7 +98,104 @@ int sql_step_retry(sqlite3_stmt* stmt) {
     return SQLITE_BUSY;
 }
 
+// FNV-1a 64-bit hash (deterministic, portable)
+uint64_t fnv1a_64(const std::string& s) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char c : s) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 }  // namespace
+
+// --- Azure key sanitization ---
+
+std::string sanitize_azure_key(const std::string& input) {
+    // Step 1: Normalize backslashes to forward slashes, then split into segments.
+    // Steps 2-3: Percent-encode control chars (0x00-0x1F, 0x7F) and
+    //            C1 control code points (U+0080-U+009F, UTF-8: 0xC2 0x80-0x9F).
+    // Step 5: Remove empty segments (from // or trailing /).
+    std::vector<std::string> segments;
+    std::string current;
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        unsigned char uc = static_cast<unsigned char>(input[i]);
+        char c = input[i];
+
+        // Treat backslash as segment separator (same as forward slash)
+        if (c == '/' || c == '\\') {
+            if (!current.empty()) {
+                segments.push_back(std::move(current));
+                current.clear();
+            }
+            continue;
+        }
+
+        // C1 control code points: UTF-8 bytes 0xC2 0x80 through 0xC2 0x9F
+        if (uc == 0xC2 && i + 1 < input.size()) {
+            unsigned char next = static_cast<unsigned char>(input[i + 1]);
+            if (next >= 0x80 && next <= 0x9F) {
+                char hex[8];
+                snprintf(hex, sizeof(hex), "%%C2%%%02X", next);
+                current += hex;
+                ++i;
+                continue;
+            }
+        }
+
+        // C0 control chars (0x00-0x1F) and DEL (0x7F)
+        if (uc <= 0x1F || uc == 0x7F) {
+            char hex[4];
+            snprintf(hex, sizeof(hex), "%%%02X", uc);
+            current += hex;
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty()) {
+        segments.push_back(std::move(current));
+    }
+
+    // Step 4: Encode trailing dots on each path segment.
+    // Only the final '.' is encoded as %2E (e.g. "bar.." → "bar.%2E").
+    for (auto& seg : segments) {
+        if (!seg.empty() && seg.back() == '.') {
+            seg.replace(seg.size() - 1, 1, "%2E");
+        }
+    }
+
+    // Step 7: Enforce 254 path segment limit.
+    // Flatten excess segments into the last allowed segment by replacing '/' with '_'.
+    if (segments.size() > 254) {
+        std::string combined;
+        for (size_t i = 253; i < segments.size(); ++i) {
+            if (i > 253) combined += '_';
+            combined += segments[i];
+        }
+        segments.resize(254);
+        segments[253] = combined;
+    }
+
+    // Join segments with '/'
+    std::string result;
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (i > 0) result += '/';
+        result += segments[i];
+    }
+
+    // Step 6: Enforce 1024-char limit.
+    // Truncate to 1007 chars + '_' + 16-char hex hash of the full key.
+    if (result.size() > 1024) {
+        uint64_t h = fnv1a_64(result);
+        char hash_buf[17];
+        snprintf(hash_buf, sizeof(hash_buf), "%016" PRIx64, h);
+        result = result.substr(0, 1007) + "_" + std::string(hash_buf, 16);
+    }
+
+    return result;
+}
 
 // --- Build backend from config ---
 
@@ -360,8 +462,12 @@ std::string DepotCache::relative_path(const std::filesystem::path& abs_path) con
 }
 
 std::string DepotCache::make_storage_key(const std::string& rel_path) const {
-    // StorageBackend implementations prepend the configured path_prefix via make_key(),
-    // so we just return the relative path as-is.
+    // Apply Azure blob name sanitization when Azure is configured as either backend.
+    // Sanitized keys are safe for all backends (only removes genuinely problematic
+    // characters), so cross-backend scenarios work correctly.
+    if (config_.primary.type == "azure" || config_.secondary.type == "azure") {
+        return sanitize_azure_key(rel_path);
+    }
     return rel_path;
 }
 

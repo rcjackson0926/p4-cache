@@ -2203,6 +2203,28 @@ private:
         total_bytes_.fetch_sub(size, std::memory_order_relaxed);
     }
 
+    /// Percent-encode each path segment while preserving '/' as separators.
+    static std::string url_encode_path(const std::string& path) {
+        std::string result;
+        size_t start = 0;
+        while (start < path.size()) {
+            auto slash = path.find('/', start);
+            std::string segment;
+            if (slash != std::string::npos) {
+                segment = path.substr(start, slash - start);
+                start = slash + 1;
+            } else {
+                segment = path.substr(start);
+                start = path.size();
+            }
+            if (!result.empty()) {
+                result += '/';
+            }
+            result += net::url_encode(segment);
+        }
+        return result;
+    }
+
     std::string build_url(const std::string& key) const {
         std::string url;
         if (!config_.endpoint.empty()) {
@@ -2212,9 +2234,9 @@ private:
         }
         if (!key.empty()) {
             if (!config_.path_prefix.empty()) {
-                url += "/" + config_.path_prefix + key;
+                url += "/" + url_encode_path(config_.path_prefix + key);
             } else {
-                url += "/" + key;
+                url += "/" + url_encode_path(key);
             }
         }
         return url;

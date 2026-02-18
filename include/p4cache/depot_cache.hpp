@@ -185,4 +185,11 @@ private:
     Stats stats_;
 };
 
+/// Sanitize a relative depot path into a valid Azure Blob Storage key.
+///
+/// Normalizes backslashes, percent-encodes control characters and C1 code points,
+/// encodes trailing dots on path segments, removes empty segments, and enforces
+/// Azure's 1024-char / 254-segment limits.
+std::string sanitize_azure_key(const std::string& input);
+
 }  // namespace p4cache

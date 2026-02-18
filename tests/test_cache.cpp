@@ -1034,6 +1034,105 @@ static void test_depot_cache_integration() {
 }
 
 // ---------------------------------------------------------------------------
+// 6. Azure key sanitization tests
+// ---------------------------------------------------------------------------
+
+static size_t count_segments(const std::string& s) {
+    if (s.empty()) return 0;
+    size_t count = 1;
+    for (char c : s) {
+        if (c == '/') ++count;
+    }
+    return count;
+}
+
+static void test_azure_key_sanitization() {
+    std::cout << "\n=== Azure key sanitization ===" << std::endl;
+
+    {
+        TEST(normal_path_unchanged);
+        auto result = sanitize_azure_key("foo/bar/file.txt");
+        ASSERT_EQ(result, std::string("foo/bar/file.txt"), "normal path");
+        PASS();
+    }
+    {
+        TEST(backslash_normalized);
+        auto result = sanitize_azure_key("foo\\bar\\file.txt");
+        ASSERT_EQ(result, std::string("foo/bar/file.txt"), "backslash normalization");
+        PASS();
+    }
+    {
+        TEST(trailing_dot_encoded);
+        auto result = sanitize_azure_key("foo/bar./file.");
+        ASSERT_EQ(result, std::string("foo/bar%2E/file%2E"), "trailing dots");
+        PASS();
+    }
+    {
+        TEST(multiple_trailing_dots);
+        auto result = sanitize_azure_key("foo/bar.../file");
+        ASSERT_EQ(result, std::string("foo/bar..%2E/file"), "multiple trailing dots");
+        PASS();
+    }
+    {
+        TEST(control_chars_encoded);
+        auto result = sanitize_azure_key(std::string("foo/\x01" "bar/\x7f" "baz"));
+        ASSERT_EQ(result, std::string("foo/%01bar/%7Fbaz"), "control chars");
+        PASS();
+    }
+    {
+        TEST(empty_segments_removed);
+        auto result = sanitize_azure_key("foo//bar///file.txt");
+        ASSERT_EQ(result, std::string("foo/bar/file.txt"), "empty segments");
+        PASS();
+    }
+    {
+        TEST(trailing_slash_removed);
+        auto result = sanitize_azure_key("foo/bar/");
+        ASSERT_EQ(result, std::string("foo/bar"), "trailing slash");
+        PASS();
+    }
+    {
+        TEST(length_limit_enforced);
+        // Build a path of 1100 characters: segments of "aaaa...a" separated by "/"
+        std::string long_path;
+        for (int i = 0; i < 110; ++i) {
+            if (i > 0) long_path += '/';
+            long_path += std::string(9, 'a');  // 110 segments * 10 chars each ≈ 1100
+        }
+        auto result = sanitize_azure_key(long_path);
+        ASSERT_TRUE(result.size() <= 1024, "result exceeds 1024 chars: " + std::to_string(result.size()));
+        ASSERT_TRUE(result.size() >= 1024, "result should be exactly 1024 chars: " + std::to_string(result.size()));
+        PASS();
+    }
+    {
+        TEST(segment_limit_enforced);
+        // Build a path with 300 segments
+        std::string many_segments;
+        for (int i = 0; i < 300; ++i) {
+            if (i > 0) many_segments += '/';
+            many_segments += "s" + std::to_string(i);
+        }
+        auto result = sanitize_azure_key(many_segments);
+        size_t seg_count = count_segments(result);
+        ASSERT_TRUE(seg_count <= 254,
+                     "too many segments: " + std::to_string(seg_count));
+        PASS();
+    }
+    {
+        TEST(mixed_issues);
+        // Input: backslash, control char, trailing dot, trailing slash
+        std::string input = std::string("foo\\.bar/\x01/baz./");
+        auto result = sanitize_azure_key(input);
+        // foo\.bar → foo/.bar (backslash becomes separator)
+        // \x01 → %01 (control char encoded)
+        // baz. → baz%2E (trailing dot encoded)
+        // trailing slash → removed (empty segment)
+        ASSERT_EQ(result, std::string("foo/.bar/%01/baz%2E"), "mixed issues");
+        PASS();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1046,6 +1145,7 @@ int main() {
     test_config_json();
     test_config_defaults_and_validation();
     test_depot_cache_integration();
+    test_azure_key_sanitization();
 
     std::cout << "\n===================" << std::endl;
     std::cout << "Results: " << tests_passed << " passed, "
