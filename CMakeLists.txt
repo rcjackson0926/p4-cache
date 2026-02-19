@@ -28,11 +28,11 @@ find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(CURL REQUIRED)
 
-# SQLite3
-find_library(SQLITE3_LIBRARY NAMES sqlite3)
-find_path(SQLITE3_INCLUDE_DIR sqlite3.h)
-if(NOT SQLITE3_LIBRARY OR NOT SQLITE3_INCLUDE_DIR)
-    message(FATAL_ERROR "SQLite3 not found")
+# LMDB (manifest database)
+find_library(LMDB_LIBRARY NAMES lmdb)
+find_path(LMDB_INCLUDE_DIR lmdb.h)
+if(NOT LMDB_LIBRARY OR NOT LMDB_INCLUDE_DIR)
+    message(FATAL_ERROR "LMDB not found (install liblmdb-dev)")
 endif()
 
 # nlohmann/json
@@ -56,10 +56,6 @@ else()
     message(STATUS "nlohmann/json fetched")
 endif()
 
-# ---- Vendored meridian (StorageBackend + ThreadPool) ----
-
-set(VENDORED_MERIDIAN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/meridian")
-
 # ---- p4-cache daemon ----
 
 add_executable(p4-cache
@@ -67,15 +63,13 @@ add_executable(p4-cache
     src/depot_cache.cpp
     src/cache_config.cpp
     src/depot_watcher.cpp
-    ${VENDORED_MERIDIAN_DIR}/src/storage/backend.cpp
-    ${VENDORED_MERIDIAN_DIR}/src/storage/write_cache.cpp
-    ${VENDORED_MERIDIAN_DIR}/src/net/http.cpp
+    src/storage_backend.cpp
+    src/http_client.cpp
 )
 
 target_include_directories(p4-cache PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${VENDORED_MERIDIAN_DIR}/include
-    ${SQLITE3_INCLUDE_DIR}
+    ${LMDB_INCLUDE_DIR}
 )
 
 target_link_libraries(p4-cache PRIVATE
@@ -85,7 +79,7 @@ target_link_libraries(p4-cache PRIVATE
     ZLIB::ZLIB
     CURL::libcurl
     nlohmann_json::nlohmann_json
-    ${SQLITE3_LIBRARY}
+    ${LMDB_LIBRARY}
 )
 
 # ---- LD_PRELOAD shim library ----
@@ -104,15 +98,13 @@ add_executable(test-p4-cache
     src/depot_cache.cpp
     src/cache_config.cpp
     src/depot_watcher.cpp
-    ${VENDORED_MERIDIAN_DIR}/src/storage/backend.cpp
-    ${VENDORED_MERIDIAN_DIR}/src/storage/write_cache.cpp
-    ${VENDORED_MERIDIAN_DIR}/src/net/http.cpp
+    src/storage_backend.cpp
+    src/http_client.cpp
 )
 
 target_include_directories(test-p4-cache PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${VENDORED_MERIDIAN_DIR}/include
-    ${SQLITE3_INCLUDE_DIR}
+    ${LMDB_INCLUDE_DIR}
 )
 
 target_link_libraries(test-p4-cache PRIVATE
@@ -122,7 +114,7 @@ target_link_libraries(test-p4-cache PRIVATE
     ZLIB::ZLIB
     CURL::libcurl
     nlohmann_json::nlohmann_json
-    ${SQLITE3_LIBRARY}
+    ${LMDB_LIBRARY}
 )
 
 # ---- Install ----

@@ -1,6 +1,5 @@
 #include "meridian/storage/backend.hpp"
 #include "meridian/core/compat.hpp"
-#include "meridian/storage/write_cache.hpp"
 #include "meridian/net/http.hpp"
 #include "meridian/core/constants.hpp"
 #include "meridian/storage/lru_cache.hpp"
@@ -844,7 +843,8 @@ public:
         bool verify_ssl = true;       // Disable for self-signed certs (e.g., MinIO)
         bool unsigned_payload = false; // Skip SHA-256 payload hashing on PUTs
         uint64_t multipart_threshold = constants::DEFAULT_MULTIPART_THRESHOLD;
-        uint64_t multipart_chunk_size = constants::DEFAULT_MULTIPART_CHUNK_SIZE;
+        uint64_t multipart_chunk_size = 5 * 1024 * 1024;  // 5 MB (S3 minimum part size)
+        size_t upload_concurrency = constants::DEFAULT_UPLOAD_CONCURRENCY;
         // Server-side encryption
         bool server_side_encryption = false;
         std::string sse_algorithm = "AES256";  // or "aws:kms"
@@ -1486,13 +1486,13 @@ private:
             off += chunk_size;
         }
 
-        // 3. Upload parts in parallel (4 concurrent)
-        static constexpr size_t MAX_PARALLEL_PARTS = 4;
+        // 3. Upload parts in parallel
+        const size_t concurrency = config_.upload_concurrency;
         std::vector<std::pair<int, std::string>> part_etags;
         std::atomic<bool> any_failed{false};
 
-        for (size_t batch_start = 0; batch_start < parts.size() && !any_failed; batch_start += MAX_PARALLEL_PARTS) {
-            size_t batch_end = std::min(batch_start + MAX_PARALLEL_PARTS, parts.size());
+        for (size_t batch_start = 0; batch_start < parts.size() && !any_failed; batch_start += concurrency) {
+            size_t batch_end = std::min(batch_start + concurrency, parts.size());
             std::vector<std::future<std::pair<int, std::string>>> futures;
 
             for (size_t i = batch_start; i < batch_end; ++i) {
@@ -1554,8 +1554,10 @@ private:
             return result;
         }
 
-        // 2. Upload parts from file
+        // 2. Read file and upload parts in parallel
         std::vector<std::pair<int, std::string>> part_etags;
+
+        // Read entire file (already know it fits in memory since put() loaded it for small files)
         std::ifstream file(path, std::ios::binary);
         if (!file) {
             abort_multipart_upload(key, upload_id);
@@ -1564,34 +1566,61 @@ private:
             return result;
         }
 
-        std::vector<uint8_t> buffer(config_.multipart_chunk_size);
-        int part_number = 1;
-        uint64_t offset = 0;
+        std::vector<uint8_t> file_data(file_size);
+        file.read(reinterpret_cast<char*>(file_data.data()), file_size);
+        if (!file && !file.eof()) {
+            abort_multipart_upload(key, upload_id);
+            result.success = false;
+            result.error_message = "Failed to read file";
+            return result;
+        }
+        file.close();
 
-        while (offset < file_size) {
-            size_t chunk_size = std::min(config_.multipart_chunk_size, file_size - offset);
-            file.read(reinterpret_cast<char*>(buffer.data()), chunk_size);
+        // Build part list
+        struct PartRange { int number = 0; size_t offset = 0; size_t size = 0; };
+        std::vector<PartRange> parts;
+        size_t off = 0;
+        int pn = 1;
+        while (off < file_size) {
+            size_t chunk_size = std::min(config_.multipart_chunk_size, file_size - off);
+            parts.push_back({pn++, off, chunk_size});
+            off += chunk_size;
+        }
 
-            if (!file && !file.eof()) {
-                abort_multipart_upload(key, upload_id);
-                result.success = false;
-                result.error_message = "Failed to read file";
-                return result;
+        // Upload parts in parallel
+        const size_t concurrency = config_.upload_concurrency;
+        std::atomic<bool> any_failed{false};
+        std::span<const uint8_t> data_span(file_data);
+
+        for (size_t batch_start = 0; batch_start < parts.size() && !any_failed; batch_start += concurrency) {
+            size_t batch_end = std::min(batch_start + concurrency, parts.size());
+            std::vector<std::future<std::pair<int, std::string>>> futures;
+
+            for (size_t i = batch_start; i < batch_end; ++i) {
+                auto& p = parts[i];
+                auto chunk = data_span.subspan(p.offset, p.size);
+                futures.push_back(std::async(std::launch::async,
+                    [this, &key, &upload_id, num = p.number, chunk]() -> std::pair<int, std::string> {
+                        std::string etag = upload_part(key, upload_id, num, chunk);
+                        return {num, etag};
+                    }));
             }
 
-            std::span<const uint8_t> chunk(buffer.data(), chunk_size);
-            std::string etag = upload_part(key, upload_id, part_number, chunk);
-
-            if (etag.empty()) {
-                abort_multipart_upload(key, upload_id);
-                result.success = false;
-                result.error_message = "Failed to upload part " + std::to_string(part_number);
-                return result;
+            for (auto& fut : futures) {
+                auto [num, etag] = fut.get();
+                if (etag.empty()) {
+                    any_failed = true;
+                } else {
+                    part_etags.emplace_back(num, etag);
+                }
             }
+        }
 
-            part_etags.emplace_back(part_number, etag);
-            offset += chunk_size;
-            part_number++;
+        if (any_failed) {
+            abort_multipart_upload(key, upload_id);
+            result.success = false;
+            result.error_message = "Failed to upload one or more parts";
+            return result;
         }
 
         // 3. Complete multipart upload
@@ -1799,8 +1828,9 @@ public:
         std::string path_prefix;
         std::string endpoint;           // Empty for Azure, custom for Azurite emulator
         bool verify_ssl = true;
-        uint64_t multipart_threshold = 100 * 1024 * 1024;  // 100 MB
-        uint64_t block_size = 4 * 1024 * 1024;              // 4 MB blocks
+        uint64_t multipart_threshold = constants::DEFAULT_MULTIPART_THRESHOLD;  // 5 MB
+        uint64_t block_size = 1 * 1024 * 1024;                               // 1 MB (no API min; 50K block limit → ~48 GB max)
+        size_t upload_concurrency = constants::DEFAULT_UPLOAD_CONCURRENCY;
     };
 
     explicit AzureStorageBackend(const Config& config)
@@ -2360,46 +2390,70 @@ private:
         sign_request(request, method, key);
     }
 
-    // Block blob upload for large files
+    // Block blob upload for large files (parallel block staging)
     PutResult put_block_blob(const std::string& key,
                              std::span<const uint8_t> data,
                              const PutOptions& options) {
         PutResult result;
 
-        // Upload blocks
-        std::vector<std::string> block_ids;
-        size_t offset = 0;
+        // 1. Build block list
+        struct BlockRange { int number = 0; size_t offset = 0; size_t size = 0; std::string block_id; };
+        std::vector<BlockRange> blocks;
+        size_t off = 0;
         int block_num = 0;
-
-        while (offset < data.size()) {
-            size_t chunk_size = std::min(static_cast<size_t>(config_.block_size), data.size() - offset);
-            auto chunk = data.subspan(offset, chunk_size);
-
+        while (off < data.size()) {
+            size_t chunk_size = std::min(static_cast<size_t>(config_.block_size), data.size() - off);
             // Block ID must be base64-encoded, same length for all blocks
             char id_buf[16];
             snprintf(id_buf, sizeof(id_buf), "%06d", block_num);
             std::string block_id = base64_encode(
                 std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(id_buf),
                                      reinterpret_cast<const uint8_t*>(id_buf) + strlen(id_buf)));
-            block_ids.push_back(block_id);
+            blocks.push_back({block_num, off, chunk_size, block_id});
+            off += chunk_size;
+            ++block_num;
+        }
 
-            auto url = build_url(key) + "?comp=block&blockid=" + net::url_encode(block_id);
+        // 2. Upload blocks in parallel
+        const size_t concurrency = config_.upload_concurrency;
+        std::vector<std::string> block_ids;
+        block_ids.reserve(blocks.size());
+        std::atomic<bool> any_failed{false};
 
-            net::HttpRequest request = net::HttpRequest::put(url,
-                std::vector<uint8_t>(chunk.begin(), chunk.end()));
+        for (size_t batch_start = 0; batch_start < blocks.size() && !any_failed; batch_start += concurrency) {
+            size_t batch_end = std::min(batch_start + concurrency, blocks.size());
+            std::vector<std::future<bool>> futures;
 
-            add_common_headers(request);
-            sign_request(request, "PUT", key);
-
-            auto response = http_client_->execute(request);
-            if (!response.ok()) {
-                result.success = false;
-                result.error_message = "Failed to upload block " + std::to_string(block_num);
-                return result;
+            for (size_t i = batch_start; i < batch_end; ++i) {
+                auto& b = blocks[i];
+                auto chunk = data.subspan(b.offset, b.size);
+                futures.push_back(std::async(std::launch::async,
+                    [this, &key, bid = b.block_id, chunk]() -> bool {
+                        auto url = build_url(key) + "?comp=block&blockid=" + net::url_encode(bid);
+                        net::HttpRequest request = net::HttpRequest::put(url,
+                            std::vector<uint8_t>(chunk.begin(), chunk.end()));
+                        add_common_headers(request);
+                        sign_request(request, "PUT", key);
+                        auto response = http_client_->execute(request);
+                        return response.ok();
+                    }));
             }
 
-            offset += chunk_size;
-            ++block_num;
+            for (auto& fut : futures) {
+                if (!fut.get()) {
+                    any_failed = true;
+                }
+            }
+        }
+
+        if (any_failed) {
+            result.success = false;
+            result.error_message = "Failed to upload one or more blocks";
+            return result;
+        }
+
+        for (const auto& b : blocks) {
+            block_ids.push_back(b.block_id);
         }
 
         // Commit block list
@@ -2508,7 +2562,9 @@ public:
         std::string credentials_file;       // Or path to JSON key file
         std::string endpoint;               // Empty for Google, custom for emulator
         bool verify_ssl = true;
-        uint64_t resumable_threshold = 5 * 1024 * 1024;  // 5 MB
+        uint64_t composite_threshold = constants::DEFAULT_MULTIPART_THRESHOLD;  // 5 MB
+        uint64_t composite_chunk_size = 2 * 1024 * 1024;   // 2 MB (no API min; compose limit 32 per call)
+        size_t upload_concurrency = constants::DEFAULT_UPLOAD_CONCURRENCY;
     };
 
     explicit GCSStorageBackend(const Config& config)
@@ -2630,8 +2686,8 @@ public:
                   const PutOptions& options) override {
         PutResult result;
 
-        if (data.size() > config_.resumable_threshold) {
-            return put_resumable(key, data, options);
+        if (data.size() > config_.composite_threshold) {
+            return put_composite(key, data, options);
         }
 
         // Simple upload
@@ -3126,60 +3182,159 @@ private:
         return result;
     }
 
-    // Resumable upload for large files
-    PutResult put_resumable(const std::string& key,
+    // Parallel composite upload for large files.
+    // Uploads chunks as temporary objects in parallel, then composes them
+    // into the final object. GCS compose supports up to 32 sources per call;
+    // we cascade when there are more chunks.
+    PutResult put_composite(const std::string& key,
                             std::span<const uint8_t> data,
                             const PutOptions& options) {
         PutResult result;
+        const std::string full_key = make_key(key);
 
-        // 1. Initiate resumable upload
-        auto url = upload_base() + "/b/" + config_.bucket + "/o?uploadType=resumable&name=" +
-                   net::url_encode(make_key(key));
-
-        std::string metadata_json = "{}";
-        if (!options.content_type.empty()) {
-            metadata_json = "{\"contentType\":\"" + options.content_type + "\"}";
+        // 1. Build chunk list
+        struct ChunkInfo { size_t index; size_t offset; size_t size; std::string temp_key; };
+        std::vector<ChunkInfo> chunks;
+        size_t off = 0;
+        size_t idx = 0;
+        while (off < data.size()) {
+            size_t chunk_size = std::min(static_cast<size_t>(config_.composite_chunk_size), data.size() - off);
+            std::string temp_key = full_key + ".__part_" + std::to_string(idx);
+            chunks.push_back({idx, off, chunk_size, temp_key});
+            off += chunk_size;
+            ++idx;
         }
 
-        net::HttpRequest init_request = net::HttpRequest::post(url, metadata_json);
-        init_request.headers.set_content_type("application/json");
-        init_request.headers.set("X-Upload-Content-Length", std::to_string(data.size()));
-        add_auth_header(init_request);
+        // 2. Upload chunks as temporary objects in parallel
+        const size_t concurrency = config_.upload_concurrency;
+        std::atomic<bool> any_failed{false};
 
-        auto init_response = http_client_->execute(init_request);
-        if (!init_response.ok()) {
+        for (size_t batch_start = 0; batch_start < chunks.size() && !any_failed; batch_start += concurrency) {
+            size_t batch_end = std::min(batch_start + concurrency, chunks.size());
+            std::vector<std::future<bool>> futures;
+
+            for (size_t i = batch_start; i < batch_end; ++i) {
+                auto& c = chunks[i];
+                auto chunk = data.subspan(c.offset, c.size);
+                futures.push_back(std::async(std::launch::async,
+                    [this, temp_name = c.temp_key, chunk]() -> bool {
+                        auto url = upload_base() + "/b/" + config_.bucket +
+                                   "/o?uploadType=media&name=" + net::url_encode(temp_name);
+                        net::HttpRequest request = net::HttpRequest::post(url,
+                            std::vector<uint8_t>(chunk.begin(), chunk.end()));
+                        request.headers.set_content_type("application/octet-stream");
+                        add_auth_header(request);
+                        auto response = http_client_->execute(request);
+                        return response.ok();
+                    }));
+            }
+
+            for (auto& fut : futures) {
+                if (!fut.get()) any_failed = true;
+            }
+        }
+
+        if (any_failed) {
+            // Clean up any uploaded temp objects
+            std::vector<std::string> temp_keys;
+            for (const auto& c : chunks) temp_keys.push_back(c.temp_key);
+            cleanup_temp_objects(temp_keys);
             result.success = false;
-            result.error_message = "Failed to initiate resumable upload";
+            result.error_message = "Failed to upload one or more chunks";
             return result;
         }
 
-        auto session_uri = init_response.headers.get("Location");
-        if (!session_uri || session_uri->empty()) {
-            result.success = false;
-            result.error_message = "No session URI in resumable upload response";
-            return result;
+        // 3. Compose temp objects into the final object.
+        //    GCS compose supports up to 32 sources per call; cascade if needed.
+        std::vector<std::string> source_names;
+        source_names.reserve(chunks.size());
+        for (const auto& c : chunks) {
+            source_names.push_back(c.temp_key);
         }
 
-        // 2. Upload data to session URI
-        net::HttpRequest upload_request = net::HttpRequest::put(*session_uri,
-            std::vector<uint8_t>(data.begin(), data.end()));
-        upload_request.headers.set_content_type(options.content_type.empty()
-            ? "application/octet-stream" : options.content_type);
-        // No auth header needed for session URI - it's pre-authenticated
+        static constexpr size_t GCS_MAX_COMPOSE = 32;
 
-        auto upload_response = http_client_->execute(upload_request);
+        while (source_names.size() > 1) {
+            std::vector<std::string> next_sources;
 
-        if (!upload_response.ok()) {
-            result.success = false;
-            result.error_message = "Failed to upload data";
-            return result;
+            for (size_t i = 0; i < source_names.size(); i += GCS_MAX_COMPOSE) {
+                size_t end = std::min(i + GCS_MAX_COMPOSE, source_names.size());
+                std::vector<std::string> batch(source_names.begin() + i, source_names.begin() + end);
+
+                // Last batch in the last cascade level → compose into the final key
+                bool is_final = (next_sources.empty() && end == source_names.size() && batch.size() <= GCS_MAX_COMPOSE);
+                std::string dest = is_final ? full_key
+                    : (full_key + ".__comp_" + std::to_string(next_sources.size()));
+
+                if (!compose_objects(dest, batch, options)) {
+                    // Clean up everything
+                    for (const auto& s : source_names) delete_object(s);
+                    for (const auto& s : next_sources) delete_object(s);
+                    result.success = false;
+                    result.error_message = "Failed to compose objects";
+                    return result;
+                }
+
+                if (!is_final) {
+                    next_sources.push_back(dest);
+                }
+
+                // Delete source temp objects that are no longer needed
+                for (const auto& s : batch) {
+                    if (s != full_key) delete_object(s);
+                }
+            }
+
+            if (next_sources.empty()) break;  // Final compose done
+            source_names = std::move(next_sources);
         }
 
         result.success = true;
-        std::string body(upload_response.body.begin(), upload_response.body.end());
-        result.etag = parse_json_string(body, "etag");
+        // Fetch etag of composed object
+        auto meta = head(key);
+        if (meta) result.etag = meta->etag;
         increment_counters(data.size());
         return result;
+    }
+
+    bool compose_objects(const std::string& destination,
+                         const std::vector<std::string>& sources,
+                         const PutOptions& options) {
+        auto url = api_base() + "/b/" + config_.bucket + "/o/" +
+                   net::url_encode(destination) + "/compose";
+
+        std::ostringstream json;
+        json << "{\"destination\":{";
+        if (!options.content_type.empty()) {
+            json << "\"contentType\":\"" << options.content_type << "\"";
+        }
+        json << "},\"sourceObjects\":[";
+        for (size_t i = 0; i < sources.size(); ++i) {
+            if (i > 0) json << ",";
+            json << "{\"name\":\"" << sources[i] << "\"}";
+        }
+        json << "]}";
+
+        std::string body = json.str();
+        net::HttpRequest request = net::HttpRequest::post(url, body);
+        request.headers.set_content_type("application/json");
+        add_auth_header(request);
+
+        auto response = http_client_->execute(request);
+        return response.ok();
+    }
+
+    void delete_object(const std::string& object_name) {
+        auto url = api_base() + "/b/" + config_.bucket + "/o/" + net::url_encode(object_name);
+        net::HttpRequest request = net::HttpRequest::del(url);
+        add_auth_header(request);
+        http_client_->execute(request);  // Best-effort cleanup
+    }
+
+    void cleanup_temp_objects(const std::vector<std::string>& temp_keys) {
+        for (const auto& k : temp_keys) {
+            delete_object(k);
+        }
     }
 
     // Simple JSON string value parser (avoids dependency on json library)
@@ -4098,24 +4253,6 @@ std::unique_ptr<StorageBackend> StorageBackendFactory::create_async_upload(
         std::move(backend), staging_path, upload_threads);
 }
 
-std::unique_ptr<StorageBackend> StorageBackendFactory::create_nvme_write_cache(
-    std::unique_ptr<StorageBackend> backend,
-    const std::filesystem::path& cache_dir,
-    size_t drain_threads,
-    uint64_t max_cache_bytes) {
-    WriteCacheConfig config;
-    config.cache_dir = cache_dir;
-    config.drain_threads = drain_threads;
-    config.max_cache_bytes = max_cache_bytes;
-    config.low_watermark_bytes = max_cache_bytes * 4 / 5;  // 80%
-    return ::meridian::create_nvme_write_cache(std::move(backend), config);
-}
-
-std::unique_ptr<StorageBackend> StorageBackendFactory::create_nvme_write_cache(
-    std::unique_ptr<StorageBackend> backend,
-    const WriteCacheConfig& config) {
-    return ::meridian::create_nvme_write_cache(std::move(backend), config);
-}
 
 std::unique_ptr<StorageBackend> StorageBackendFactory::create_azure(
     const std::string& account_name,

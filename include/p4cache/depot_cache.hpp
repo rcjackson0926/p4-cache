@@ -7,16 +7,13 @@
 #include <condition_variable>
 #include <filesystem>
 #include <future>
+#include <lmdb.h>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
-
-// Forward declarations
-struct sqlite3;
-struct sqlite3_stmt;
 
 namespace meridian {
 class StorageBackend;
@@ -27,7 +24,7 @@ namespace p4cache {
 
 /// Core depot cache engine.
 ///
-/// Manages the SQLite manifest, upload workers (read-write mode only),
+/// Manages the LMDB manifest, upload workers (read-write mode only),
 /// restore workers, LRU eviction, and the Unix socket shim server.
 ///
 /// Supports a primary backend (read-write) and an optional secondary
@@ -46,7 +43,7 @@ public:
     DepotCache(const DepotCache&) = delete;
     DepotCache& operator=(const DepotCache&) = delete;
 
-    /// Initialize the cache: open SQLite, create storage backends, start workers.
+    /// Initialize the cache: open LMDB, create storage backends, start workers.
     /// Returns error message on failure, empty string on success.
     std::string start();
 
@@ -62,8 +59,7 @@ public:
     /// Only used in read-write mode.
     void on_file_written(const std::filesystem::path& path);
 
-    /// Called on FAN_OPEN_PERM: check if file is a 0-byte evicted stub.
-    /// If so, restore from storage before allowing the open.
+    /// Called on FAN_OPEN_PERM: update LRU access time.
     /// @return true to allow the open, false to deny.
     bool on_file_open(const std::filesystem::path& path);
 
@@ -82,7 +78,6 @@ public:
         uint64_t dirty_files = 0;
         uint64_t uploading_files = 0;
         uint64_t clean_files = 0;
-        uint64_t evicted_files = 0;
         uint64_t cache_bytes = 0;
         uint64_t uploads_completed = 0;
         uint64_t uploads_failed = 0;
@@ -98,11 +93,11 @@ public:
     bool is_read_only() const { return config_.read_only; }
 
 private:
-    // SQLite manifest operations
+    // LMDB manifest operations
     void init_manifest();
+    void init_counters();
     void crash_recovery();
     void scan_untracked_files();
-    uint64_t calculate_cache_bytes();
 
     // File state
     std::string relative_path(const std::filesystem::path& abs_path) const;
@@ -138,18 +133,25 @@ private:
     // Config
     CacheConfig config_;
 
-    // SQLite manifest
-    // Write operations use BEGIN IMMEDIATE for proper serialization.
-    // WAL mode allows concurrent readers.
-    std::mutex db_mutex_;  // Protects prepared statement usage
-    sqlite3* db_ = nullptr;
-    sqlite3_stmt* stmt_insert_ = nullptr;
-    sqlite3_stmt* stmt_update_state_ = nullptr;
-    sqlite3_stmt* stmt_get_entry_ = nullptr;
-    sqlite3_stmt* stmt_get_dirty_batch_ = nullptr;
-    sqlite3_stmt* stmt_get_evict_candidates_ = nullptr;
-    sqlite3_stmt* stmt_update_access_ = nullptr;
-    sqlite3_stmt* stmt_get_stats_ = nullptr;
+    // LMDB manifest
+    //
+    // Three named databases:
+    //   files:       key=path(string)                  value=FileEntry(packed)
+    //   dirty_queue: key=created_at(8B BE)+path        value=(empty)
+    //   evict_order: key=last_access(8B BE)+path       value=(empty)
+    //
+    // Write transactions are serialized by db_mutex_.
+    // Read-only transactions can run concurrently (LMDB supports this natively).
+    std::mutex db_mutex_;
+    MDB_env* mdb_env_ = nullptr;
+    MDB_dbi dbi_files_ = 0;
+    MDB_dbi dbi_dirty_ = 0;
+    MDB_dbi dbi_evict_ = 0;
+
+    // In-memory stats counters (updated atomically on state transitions)
+    std::atomic<uint64_t> count_dirty_{0};
+    std::atomic<uint64_t> count_uploading_{0};
+    std::atomic<uint64_t> count_clean_{0};
 
     // Storage backends
     std::unique_ptr<meridian::StorageBackend> primary_;     // read-write

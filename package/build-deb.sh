@@ -108,7 +108,7 @@ Package: ${PKG_NAME}
 Version: ${VERSION}
 Architecture: ${ARCH}
 Maintainer: RCJackson Consulting <rusty@rcjacksonconsulting.com>
-Depends: libsqlite3-0, libcurl4t64 | libcurl4, libssl3t64 | libssl3, zlib1g
+Depends: liblmdb0, libcurl4t64 | libcurl4, libssl3t64 | libssl3, zlib1g
 Recommends: socat
 Section: admin
 Priority: optional
@@ -117,8 +117,8 @@ Homepage: https://www.perforce.com
 Description: NVMe depot acceleration daemon for Perforce
  p4-cache provides a transparent NVMe caching layer between Perforce (P4d)
  and remote object storage (S3, Azure Blob, GCS, or NFS). It uploads new
- depot files in the background, evicts cold files to 0-byte stubs, and
- restores them on demand via an LD_PRELOAD shim.
+ depot files in the background, evicts cold files when the cache fills,
+ and restores them on demand via an LD_PRELOAD shim.
  .
  Package contents:
   - p4-cache: the cache daemon

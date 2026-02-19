@@ -51,6 +51,9 @@ struct CacheConfig {
     // Manifest
     std::filesystem::path state_dir;  // Default: <depot_path>/.p4cache/
 
+    // Startup
+    bool skip_startup_scan = false;  // Skip scan_untracked_files() on startup
+
     // Tuning
     size_t upload_batch_size = 64;
     std::chrono::milliseconds upload_poll_interval{100};

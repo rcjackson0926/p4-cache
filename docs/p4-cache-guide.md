@@ -2,7 +2,7 @@
 
 Quick-reference for running `p4-cache`. For full details see:
 - [Configuration Reference](configuration.md) — all CLI flags, JSON fields, environment variables
-- [Architecture](architecture.md) — design, threading, data flow, SQLite schema
+- [Architecture](architecture.md) — design, threading, data flow, LMDB schema
 - [Deployment Guide](deployment.md) — systemd, permissions, monitoring, troubleshooting
 
 ## Required Arguments
@@ -115,7 +115,7 @@ Uploads go to primary only. Restores try primary first, then secondary.
 
 ## LD_PRELOAD Shim
 
-Start P4d with the shim to enable cold-file and evicted-stub interception:
+Start P4d with the shim to enable cold-file restore interception:
 
 ```bash
 LD_PRELOAD=/usr/local/lib/libp4shim.so P4CACHE_DEPOT=/mnt/nvme/depot \
@@ -159,9 +159,8 @@ kill -0 $(cat /var/run/p4-cache.pid) && echo OK
 # Test socket connectivity
 echo "FETCH test" | socat - UNIX-CONNECT:/mnt/nvme/depot/.p4cache/shim.sock
 
-# Check manifest stats
-sqlite3 /mnt/nvme/depot/.p4cache/manifest.db \
-  "SELECT state, COUNT(*), SUM(size)/1073741824.0 AS gb FROM cache_entries GROUP BY state;"
+# Check manifest stats (use mdb_stat from lmdb-utils)
+mdb_stat -a /mnt/nvme/depot/.p4cache/manifest.lmdb
 ```
 
 ## Operational Recommendations

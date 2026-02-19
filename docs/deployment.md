@@ -8,6 +8,7 @@ This guide covers production deployment of `p4-cache` including system setup, se
 - NVMe storage mounted at the depot path
 - Remote storage accessible (S3/Azure/GCS credentials or NFS mount)
 - `p4-cache` and `libp4shim.so` built and installed
+- `liblmdb-dev` installed (for the LMDB manifest)
 
 ## Installation
 
@@ -231,9 +232,11 @@ The daemon logs stats at the configured interval (default 60s):
 
 ```
 [stats] cache=245.3/500.0 GB | files: 1523400 total, 12 dirty, 3 uploading,
-1200000 clean, 323385 evicted | uploads: 890234 ok, 12 fail | restores: 45021 ok,
+1200000 clean | uploads: 890234 ok, 12 fail | restores: 45021 ok,
 3 fail (120 secondary) | evictions: 323385 | shim: 44901 fetch, 230 miss
 ```
+
+Note: stats are maintained as in-memory atomic counters (no DB query needed). The "evicted" count is not shown because evicted files are deleted from the manifest entirely.
 
 ### Key Metrics to Watch
 
@@ -264,35 +267,42 @@ echo "FETCH test/nonexistent" | socat - UNIX-CONNECT:/mnt/nvme/depot/.p4cache/sh
 # Expected: "NOTFOUND" (daemon is responsive)
 ```
 
-### SQLite Manifest Inspection
+### LMDB Manifest Inspection
+
+The manifest is an LMDB environment at `<depot>/.p4cache/manifest/`. Use the `mdb_stat` and `mdb_dump` tools from `lmdb-utils`:
 
 ```bash
-# File counts by state
-sqlite3 /mnt/nvme/depot/.p4cache/manifest.db \
-  "SELECT state, COUNT(*), SUM(size) FROM cache_entries GROUP BY state;"
+# Database statistics (entry counts, page usage, depth)
+mdb_stat -a /mnt/nvme/depot/.p4cache/manifest/
 
-# Oldest dirty files (upload backlog)
-sqlite3 /mnt/nvme/depot/.p4cache/manifest.db \
-  "SELECT path, datetime(created_at, 'unixepoch') FROM cache_entries
-   WHERE state='dirty' ORDER BY created_at LIMIT 10;"
+# Dump all keys in the files database (hex format)
+mdb_dump -s files /mnt/nvme/depot/.p4cache/manifest/
 
-# Largest clean files (eviction candidates)
-sqlite3 /mnt/nvme/depot/.p4cache/manifest.db \
-  "SELECT path, size/1048576 AS mb FROM cache_entries
-   WHERE state='clean' ORDER BY size DESC LIMIT 10;"
+# Environment info (map size, page size, max readers)
+mdb_stat -e /mnt/nvme/depot/.p4cache/manifest/
 ```
 
-## Cache Sizing Guidelines
+## Scaling
 
-### Sizing the Cache
+### Billion-File Depots
 
-The NVMe cache should be large enough to hold your working set — the files actively being read and written during normal operations. Typical sizing:
+p4-cache is designed for depots approaching 1 PB with billions of files. Key design decisions for this scale:
+
+- **LMDB manifest**: Memory-mapped B+ tree handles billions of keys natively. No WAL checkpointing or compaction overhead.
+- **Delete on eviction**: Evicted files are unlinked (not truncated to 0-byte stubs), avoiding inode exhaustion on ext4 and preventing unbounded manifest growth.
+- **3 file states only**: dirty, uploading, clean. No "evicted" state means the manifest only contains files currently on NVMe (bounded by cache size, not depot size).
+- **In-memory stats**: Atomic counters updated on state transitions. No `GROUP BY` queries over billions of rows.
+- **Optional startup scan**: Use `--skip-startup-scan` for 30-60 TB caches where scanning billions of files takes hours. Files written while the daemon was down will be caught by fanotify when next modified, or restored from storage by the shim when next read.
+
+### Sizing Guidelines
+
+The NVMe cache should be large enough to hold your working set — the files actively being read and written during normal operations.
 
 | Scenario | Recommended cache size |
 |----------|----------------------|
 | Small depot (< 100 GB) | 1.5x total depot size |
 | Medium depot, active development | 30-50% of total depot size |
-| Large depot, CI workloads | 10-20% of total depot size, focused on recent changelists |
+| Large depot (PB-scale), CI workloads | 30-60 TB NVMe, `--skip-startup-scan` |
 
 ### Sizing the Watermarks
 
@@ -339,20 +349,18 @@ If the stats show files being evicted and immediately restored:
 - Increase `--max-cache-gb` and `--low-watermark-gb`
 - Or identify which files are being accessed repeatedly and ensure they stay warm
 
-### SQLite "database is locked" errors
-
-The daemon uses WAL mode and retries SQLITE_BUSY up to 10 times with backoff. If you see lock errors:
-- Don't run external tools that lock the manifest while the daemon is running
-- If inspecting the manifest, use read-only access: `sqlite3 -readonly manifest.db`
-
 ## Backup and Recovery
 
 ### Backing Up the Manifest
 
-The manifest can be backed up while the daemon is running (WAL mode supports concurrent reads):
+The LMDB manifest can be copied while the daemon is running. LMDB uses copy-on-write, so readers see a consistent snapshot. To make a safe backup:
 
 ```bash
-sqlite3 /mnt/nvme/depot/.p4cache/manifest.db ".backup /backup/manifest.db"
+# Use mdb_copy for a consistent snapshot
+mdb_copy /mnt/nvme/depot/.p4cache/manifest/ /backup/manifest/
+
+# Or with compaction (smaller output)
+mdb_copy -c /mnt/nvme/depot/.p4cache/manifest/ /backup/manifest/
 ```
 
 ### Resetting the Cache
@@ -367,12 +375,12 @@ sudo systemctl start p4-cache
 
 On restart, the daemon will:
 1. Create a new empty manifest
-2. Scan the depot for untracked files and register them as dirty
+2. Scan the depot for untracked files and register them as dirty (unless `--skip-startup-scan`)
 3. Begin uploading them to the primary backend
 
 ### Crash Recovery
 
-On startup, the daemon automatically resets any entries in `uploading` state back to `dirty`. This ensures no files are lost if the daemon crashes mid-upload.
+On startup, the daemon automatically resets any entries in `uploading` state back to `dirty`. This ensures no files are lost if the daemon crashes mid-upload. LMDB is crash-safe by default (no WAL replay needed).
 
 ### Failover to a Standby Server
 
@@ -397,17 +405,11 @@ If the primary server has a hardware problem (e.g., memory failure) but the NVMe
    sudo systemctl start p4d
    ```
 
-On startup, p4-cache runs crash recovery (resets `uploading` entries to `dirty`) and resumes normal operation. Clean files are recognized as already uploaded. Evicted 0-byte stubs restore on demand from the backend.
+On startup, p4-cache runs crash recovery (resets `uploading` entries to `dirty`) and resumes normal operation. Clean files are recognized as already uploaded. Evicted files are already gone from disk and manifest — they'll be fetched from storage on demand.
 
-**Important: copy the WAL file.** If p4-cache wasn't stopped cleanly before copying, the SQLite WAL file (`manifest.db-wal`) contains recent transactions that haven't been folded into the main database. You must copy `manifest.db`, `manifest.db-wal`, and `manifest.db-shm` together. If only `manifest.db` is copied, recent state changes are lost — those files will be re-scanned and re-uploaded, which is wasteful but not destructive.
+**Important: copy the LMDB lock file.** The manifest directory contains `data.mdb` and `lock.mdb`. Both must be copied together. If the daemon was not stopped cleanly, LMDB's crash recovery will handle any incomplete transactions on startup.
 
-**If you can't stop p4-cache before copying**, don't rsync the manifest while the daemon is writing to it. Instead, take a consistent snapshot:
-```bash
-sqlite3 /mnt/nvme/depot/.p4cache/manifest.db ".backup /tmp/manifest-snapshot.db"
-```
-Then rsync the depot files separately and place the snapshot at `<depot>/.p4cache/manifest.db` on the standby.
-
-**If you skip the manifest entirely** and only copy the depot files, p4-cache will start with an empty manifest. `scan_untracked_files()` will mark every file on disk as dirty and re-upload it to the backend. For a large cache this means a full re-upload, but nothing breaks.
+**If you skip the manifest entirely** and only copy the depot files, p4-cache will start with an empty manifest. `scan_untracked_files()` will mark every file on disk as dirty and re-upload it to the backend. For a large cache this means a full re-upload, but nothing breaks. Use `--skip-startup-scan` to defer this if the scan would take too long.
 
 ### Data Durability and the Dirty Window
 

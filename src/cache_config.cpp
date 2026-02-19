@@ -197,6 +197,8 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
             auto* v = next_arg(i, "--config");
             if (!v) return std::nullopt;
             if (!config.load_json(v)) return std::nullopt;
+        } else if (arg == "--skip-startup-scan") {
+            config.skip_startup_scan = true;
         } else if (arg == "--daemon") {
             config.daemonize = true;
         } else if (arg == "--verbose") {
@@ -256,6 +258,7 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
                 "  --verbose                        Verbose output\n"
                 "  --pid-file <path>                PID file path\n"
                 "  --log-file <path>                Log file path\n"
+                "  --skip-startup-scan              Skip scanning for untracked files on startup\n"
                 "  --stats-interval <secs>          Stats reporting interval (default: 60)\n"
                 "  --help                           Show this help\n";
             return std::nullopt;
@@ -302,6 +305,7 @@ bool CacheConfig::load_json(const std::filesystem::path& path) {
         if (j.contains("upload_concurrency")) upload_concurrency = j["upload_concurrency"].get<size_t>();
         if (j.contains("restore_threads")) restore_threads = j["restore_threads"].get<size_t>();
         if (j.contains("verbose")) verbose = j["verbose"].get<bool>();
+        if (j.contains("skip_startup_scan")) skip_startup_scan = j["skip_startup_scan"].get<bool>();
         if (j.contains("stats_interval")) stats_interval_secs = j["stats_interval"].get<size_t>();
 
         // Parse primary backend

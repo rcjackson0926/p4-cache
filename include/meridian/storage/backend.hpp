@@ -16,9 +16,6 @@
 
 namespace meridian {
 
-// Forward declaration for write cache config
-struct WriteCacheConfig;
-
 // Metadata about a stored object
 struct ObjectMetadata {
     uint64_t size = 0;
@@ -208,21 +205,6 @@ public:
         std::unique_ptr<StorageBackend> backend,
         const std::filesystem::path& staging_path,
         size_t upload_threads = 4);
-
-    // Create a persistent NVMe write cache wrapper
-    // Crash-safe: SQLite manifest survives restarts, drain resumes automatically.
-    // Writes at NVMe speed (~3-7 GB/s), background threads drain to permanent backend.
-    // Supports backpressure when cache fills up.
-    static std::unique_ptr<StorageBackend> create_nvme_write_cache(
-        std::unique_ptr<StorageBackend> backend,
-        const std::filesystem::path& cache_dir,
-        size_t drain_threads = 8,
-        uint64_t max_cache_bytes = 50ULL * 1024 * 1024 * 1024);
-
-    // Full config overload for complete control over write cache parameters
-    static std::unique_ptr<StorageBackend> create_nvme_write_cache(
-        std::unique_ptr<StorageBackend> backend,
-        const WriteCacheConfig& config);
 
     // Create an Azure Blob Storage backend
     static std::unique_ptr<StorageBackend> create_azure(

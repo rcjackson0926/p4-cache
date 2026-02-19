@@ -4,13 +4,14 @@
 
 #include <cinttypes>
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
-#include <sqlite3.h>
+#include <lmdb.h>
 #include <sstream>
 #include <vector>
 #include <sys/socket.h>
@@ -22,23 +23,88 @@ namespace p4cache {
 
 namespace {
 
-constexpr const char* MANIFEST_SCHEMA = R"(
-CREATE TABLE IF NOT EXISTS cache_entries (
-    path TEXT PRIMARY KEY,
-    size INTEGER NOT NULL,
-    storage_key TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'dirty',
-    last_access INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    etag TEXT
-) WITHOUT ROWID;
+// File states stored in LMDB FileEntry
+enum class FileState : uint8_t {
+    Dirty = 0,
+    Uploading = 1,
+    Clean = 2,
+};
 
-CREATE INDEX IF NOT EXISTS idx_evict
-    ON cache_entries(state, last_access) WHERE state = 'clean';
+// FileEntry value format (packed, variable length):
+//   [8B size][8B last_access][8B created_at][1B state][storage_key bytes...]
+struct FileEntry {
+    uint64_t size = 0;
+    uint64_t last_access = 0;
+    uint64_t created_at = 0;
+    FileState state = FileState::Dirty;
+    std::string storage_key;
+};
 
-CREATE INDEX IF NOT EXISTS idx_drain
-    ON cache_entries(state, created_at) WHERE state = 'dirty';
-)";
+std::vector<uint8_t> encode_file_entry(const FileEntry& e) {
+    std::vector<uint8_t> buf(25 + e.storage_key.size());
+    memcpy(buf.data(), &e.size, 8);
+    memcpy(buf.data() + 8, &e.last_access, 8);
+    memcpy(buf.data() + 16, &e.created_at, 8);
+    buf[24] = static_cast<uint8_t>(e.state);
+    memcpy(buf.data() + 25, e.storage_key.data(), e.storage_key.size());
+    return buf;
+}
+
+FileEntry decode_file_entry(MDB_val val) {
+    FileEntry e;
+    if (val.mv_size < 25) return e;
+    const uint8_t* p = static_cast<const uint8_t*>(val.mv_data);
+    memcpy(&e.size, p, 8);
+    memcpy(&e.last_access, p + 8, 8);
+    memcpy(&e.created_at, p + 16, 8);
+    e.state = static_cast<FileState>(p[24]);
+    if (val.mv_size > 25) {
+        e.storage_key.assign(reinterpret_cast<const char*>(p + 25), val.mv_size - 25);
+    }
+    return e;
+}
+
+// Encode uint64_t as big-endian for LMDB key sorting
+void encode_be64(uint8_t* buf, uint64_t val) {
+    buf[0] = (val >> 56) & 0xFF;
+    buf[1] = (val >> 48) & 0xFF;
+    buf[2] = (val >> 40) & 0xFF;
+    buf[3] = (val >> 32) & 0xFF;
+    buf[4] = (val >> 24) & 0xFF;
+    buf[5] = (val >> 16) & 0xFF;
+    buf[6] = (val >> 8) & 0xFF;
+    buf[7] = val & 0xFF;
+}
+
+uint64_t decode_be64(const uint8_t* buf) {
+    return (uint64_t(buf[0]) << 56) | (uint64_t(buf[1]) << 48) |
+           (uint64_t(buf[2]) << 40) | (uint64_t(buf[3]) << 32) |
+           (uint64_t(buf[4]) << 24) | (uint64_t(buf[5]) << 16) |
+           (uint64_t(buf[6]) << 8)  |  uint64_t(buf[7]);
+}
+
+// Build composite index key: [8B big-endian timestamp][path bytes]
+std::vector<uint8_t> make_index_key(uint64_t timestamp, const std::string& path) {
+    std::vector<uint8_t> key(8 + path.size());
+    encode_be64(key.data(), timestamp);
+    memcpy(key.data() + 8, path.data(), path.size());
+    return key;
+}
+
+// Remove index entries for a file entry from the appropriate index DB
+void remove_indexes(MDB_txn* txn, MDB_dbi dbi_dirty, MDB_dbi dbi_evict,
+                    const std::string& path, const FileEntry& entry) {
+    if (entry.state == FileState::Dirty) {
+        auto key = make_index_key(entry.created_at, path);
+        MDB_val k = {key.size(), key.data()};
+        mdb_del(txn, dbi_dirty, &k, nullptr);
+    } else if (entry.state == FileState::Clean) {
+        auto key = make_index_key(entry.last_access, path);
+        MDB_val k = {key.size(), key.data()};
+        mdb_del(txn, dbi_evict, &k, nullptr);
+    }
+    // Uploading state has no index entry
+}
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -64,38 +130,6 @@ void log_error(const char* fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fputc('\n', stderr);
-}
-
-// Execute a SQL statement with retry on SQLITE_BUSY
-bool sql_exec(sqlite3* db, const char* sql) {
-    for (int attempt = 0; attempt < 10; ++attempt) {
-        char* err = nullptr;
-        int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
-        if (rc == SQLITE_OK) return true;
-        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-            if (err) sqlite3_free(err);
-            std::this_thread::sleep_for(std::chrono::milliseconds(10 * (attempt + 1)));
-            continue;
-        }
-        if (err) {
-            log_error("SQL error: %s (rc=%d)", err, rc);
-            sqlite3_free(err);
-        }
-        return false;
-    }
-    log_error("SQL timed out after retries");
-    return false;
-}
-
-// Step a prepared statement with SQLITE_BUSY retry
-int sql_step_retry(sqlite3_stmt* stmt) {
-    for (int attempt = 0; attempt < 10; ++attempt) {
-        int rc = sqlite3_step(stmt);
-        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) return rc;
-        sqlite3_reset(stmt);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10 * (attempt + 1)));
-    }
-    return SQLITE_BUSY;
 }
 
 // FNV-1a 64-bit hash (deterministic, portable)
@@ -210,18 +244,9 @@ DepotCache::DepotCache(const CacheConfig& config) : config_(config) {}
 DepotCache::~DepotCache() {
     stop();
 
-    // Finalize prepared statements
-    if (stmt_insert_) sqlite3_finalize(stmt_insert_);
-    if (stmt_update_state_) sqlite3_finalize(stmt_update_state_);
-    if (stmt_get_entry_) sqlite3_finalize(stmt_get_entry_);
-    if (stmt_get_dirty_batch_) sqlite3_finalize(stmt_get_dirty_batch_);
-    if (stmt_get_evict_candidates_) sqlite3_finalize(stmt_get_evict_candidates_);
-    if (stmt_update_access_) sqlite3_finalize(stmt_update_access_);
-    if (stmt_get_stats_) sqlite3_finalize(stmt_get_stats_);
-
-    if (db_) {
-        sqlite3_exec(db_, "PRAGMA wal_checkpoint(TRUNCATE)", nullptr, nullptr, nullptr);
-        sqlite3_close(db_);
+    if (mdb_env_) {
+        mdb_env_close(mdb_env_);
+        mdb_env_ = nullptr;
     }
 
     if (shim_sock_fd_ >= 0) {
@@ -241,7 +266,7 @@ std::string DepotCache::start() {
     std::filesystem::create_directories(config_.state_dir, ec);
     if (ec) return "Failed to create state_dir: " + ec.message();
 
-    // Initialize SQLite manifest
+    // Initialize LMDB manifest
     try {
         init_manifest();
     } catch (const std::exception& e) {
@@ -256,13 +281,15 @@ std::string DepotCache::start() {
 
     // Crash recovery
     crash_recovery();
-    cache_bytes_ = calculate_cache_bytes();
+
+    // Initialize in-memory counters from LMDB
+    init_counters();
 
     log_info("Cache initialized: %lu bytes tracked, read-only=%s",
              cache_bytes_.load(), config_.read_only ? "true" : "false");
 
     // Scan for untracked files (files written while daemon was down)
-    if (!config_.read_only) {
+    if (!config_.read_only && !config_.skip_startup_scan) {
         scan_untracked_files();
     }
 
@@ -341,64 +368,144 @@ void DepotCache::wait() {
 // --- Manifest ---
 
 void DepotCache::init_manifest() {
-    auto db_path = config_.state_dir / "manifest.db";
-    int rc = sqlite3_open(db_path.c_str(), &db_);
-    if (rc != SQLITE_OK) {
-        throw std::runtime_error("Cannot open manifest: " + std::string(sqlite3_errmsg(db_)));
+    auto manifest_dir = config_.state_dir / "manifest";
+    std::filesystem::create_directories(manifest_dir);
+
+    int rc = mdb_env_create(&mdb_env_);
+    if (rc) {
+        throw std::runtime_error("mdb_env_create: " + std::string(mdb_strerror(rc)));
     }
 
-    // WAL mode for concurrent readers
-    sql_exec(db_, "PRAGMA journal_mode=WAL");
-    sql_exec(db_, "PRAGMA synchronous=NORMAL");
-    sql_exec(db_, "PRAGMA cache_size=-65536");  // 64 MB
-    sql_exec(db_, "PRAGMA busy_timeout=5000");
-    sql_exec(db_, "PRAGMA wal_autocheckpoint=10000");
-    sql_exec(db_, MANIFEST_SCHEMA);
+    // 1 TB map size (virtual address space only; actual usage is sparse)
+    rc = mdb_env_set_mapsize(mdb_env_, 1ULL * 1024 * 1024 * 1024 * 1024);
+    if (rc) {
+        mdb_env_close(mdb_env_);
+        mdb_env_ = nullptr;
+        throw std::runtime_error("mdb_env_set_mapsize: " + std::string(mdb_strerror(rc)));
+    }
 
-    // Prepare statements
-    sqlite3_prepare_v2(db_,
-        "INSERT OR REPLACE INTO cache_entries (path, size, storage_key, state, last_access, created_at, etag) "
-        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        -1, &stmt_insert_, nullptr);
+    // 3 named databases: files, dirty_queue, evict_order
+    mdb_env_set_maxdbs(mdb_env_, 3);
 
-    sqlite3_prepare_v2(db_,
-        "UPDATE cache_entries SET state = ?2, size = ?3 WHERE path = ?1",
-        -1, &stmt_update_state_, nullptr);
+    rc = mdb_env_open(mdb_env_, manifest_dir.c_str(), 0, 0664);
+    if (rc) {
+        mdb_env_close(mdb_env_);
+        mdb_env_ = nullptr;
+        throw std::runtime_error("mdb_env_open: " + std::string(mdb_strerror(rc)));
+    }
 
-    sqlite3_prepare_v2(db_,
-        "SELECT path, size, storage_key, state, last_access, etag FROM cache_entries WHERE path = ?1",
-        -1, &stmt_get_entry_, nullptr);
+    // Open named databases within a single transaction
+    MDB_txn* txn = nullptr;
+    rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+    if (rc) {
+        throw std::runtime_error("mdb_txn_begin: " + std::string(mdb_strerror(rc)));
+    }
 
-    sqlite3_prepare_v2(db_,
-        "SELECT path, storage_key FROM cache_entries WHERE state = 'dirty' ORDER BY created_at ASC LIMIT ?1",
-        -1, &stmt_get_dirty_batch_, nullptr);
+    rc = mdb_dbi_open(txn, "files", MDB_CREATE, &dbi_files_);
+    if (rc) { mdb_txn_abort(txn); throw std::runtime_error("open files db: " + std::string(mdb_strerror(rc))); }
 
-    sqlite3_prepare_v2(db_,
-        "SELECT path, size FROM cache_entries WHERE state = 'clean' ORDER BY last_access ASC LIMIT ?1",
-        -1, &stmt_get_evict_candidates_, nullptr);
+    rc = mdb_dbi_open(txn, "dirty_queue", MDB_CREATE, &dbi_dirty_);
+    if (rc) { mdb_txn_abort(txn); throw std::runtime_error("open dirty_queue db: " + std::string(mdb_strerror(rc))); }
 
-    sqlite3_prepare_v2(db_,
-        "UPDATE cache_entries SET last_access = ?2 WHERE path = ?1",
-        -1, &stmt_update_access_, nullptr);
+    rc = mdb_dbi_open(txn, "evict_order", MDB_CREATE, &dbi_evict_);
+    if (rc) { mdb_txn_abort(txn); throw std::runtime_error("open evict_order db: " + std::string(mdb_strerror(rc))); }
 
-    sqlite3_prepare_v2(db_,
-        "SELECT state, COUNT(*), COALESCE(SUM(size), 0) FROM cache_entries GROUP BY state",
-        -1, &stmt_get_stats_, nullptr);
+    rc = mdb_txn_commit(txn);
+    if (rc) {
+        throw std::runtime_error("mdb_txn_commit: " + std::string(mdb_strerror(rc)));
+    }
+}
+
+void DepotCache::init_counters() {
+    uint64_t dirty = 0, uploading = 0, clean = 0, bytes = 0;
+
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(mdb_env_, nullptr, MDB_RDONLY, &txn);
+    if (rc) return;
+
+    MDB_cursor* cursor = nullptr;
+    rc = mdb_cursor_open(txn, dbi_files_, &cursor);
+    if (rc) { mdb_txn_abort(txn); return; }
+
+    MDB_val key, val;
+    while (mdb_cursor_get(cursor, &key, &val, MDB_NEXT) == 0) {
+        auto entry = decode_file_entry(val);
+        bytes += entry.size;
+        switch (entry.state) {
+            case FileState::Dirty: ++dirty; break;
+            case FileState::Uploading: ++uploading; break;
+            case FileState::Clean: ++clean; break;
+        }
+    }
+
+    mdb_cursor_close(cursor);
+    mdb_txn_abort(txn);
+
+    count_dirty_ = dirty;
+    count_uploading_ = uploading;
+    count_clean_ = clean;
+    cache_bytes_ = bytes;
 }
 
 void DepotCache::crash_recovery() {
     // Reset any 'uploading' entries back to 'dirty' (may not have completed)
-    sql_exec(db_, "UPDATE cache_entries SET state = 'dirty' WHERE state = 'uploading'");
+    std::lock_guard<std::mutex> db_lock(db_mutex_);
 
-    log_info("Crash recovery: reset uploading entries to dirty");
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+    if (rc) return;
+
+    MDB_cursor* cursor = nullptr;
+    rc = mdb_cursor_open(txn, dbi_files_, &cursor);
+    if (rc) { mdb_txn_abort(txn); return; }
+
+    size_t reset_count = 0;
+    MDB_val key, val;
+    while (mdb_cursor_get(cursor, &key, &val, MDB_NEXT) == 0) {
+        auto entry = decode_file_entry(val);
+        if (entry.state != FileState::Uploading) continue;
+
+        std::string path(static_cast<const char*>(key.mv_data), key.mv_size);
+        auto now = now_epoch();
+
+        // uploading → dirty
+        entry.state = FileState::Dirty;
+        entry.created_at = now;
+        auto new_val = encode_file_entry(entry);
+        MDB_val nv = {new_val.size(), new_val.data()};
+        mdb_cursor_put(cursor, &key, &nv, MDB_CURRENT);
+
+        // Add to dirty_queue
+        auto dk = make_index_key(static_cast<uint64_t>(now), path);
+        MDB_val dkv = {dk.size(), dk.data()};
+        MDB_val empty = {0, nullptr};
+        mdb_put(txn, dbi_dirty_, &dkv, &empty, 0);
+
+        ++reset_count;
+    }
+
+    mdb_cursor_close(cursor);
+    rc = mdb_txn_commit(txn);
+    if (rc) {
+        log_error("Crash recovery commit failed: %s", mdb_strerror(rc));
+    }
+
+    log_info("Crash recovery: reset %zu uploading entries to dirty", reset_count);
 }
 
 void DepotCache::scan_untracked_files() {
-    // Walk depot directory for files not in the manifest
     size_t found = 0;
     auto now = now_epoch();
 
-    sql_exec(db_, "BEGIN TRANSACTION");
+    // Collect untracked files first, then batch-insert
+    struct UntrackedFile {
+        std::string rel_path;
+        std::string storage_key;
+        uint64_t file_size;
+    };
+    std::vector<UntrackedFile> untracked;
+
+    // Read-only scan: check each file against LMDB
     for (auto& entry : std::filesystem::recursive_directory_iterator(
              config_.depot_path,
              std::filesystem::directory_options::skip_permission_denied)) {
@@ -410,48 +517,68 @@ void DepotCache::scan_untracked_files() {
         // Skip .p4cache directory
         if (rel.compare(0, 9, ".p4cache/") == 0 || rel == ".p4cache") continue;
 
-        // Check if already tracked
-        sqlite3_reset(stmt_get_entry_);
-        sqlite3_bind_text(stmt_get_entry_, 1, rel.c_str(), -1, SQLITE_TRANSIENT);
-        int rc = sql_step_retry(stmt_get_entry_);
-        if (rc == SQLITE_ROW) continue;  // Already tracked
+        // Check if already tracked (read-only txn, no mutex needed)
+        MDB_txn* rtxn = nullptr;
+        int rc = mdb_txn_begin(mdb_env_, nullptr, MDB_RDONLY, &rtxn);
+        if (rc) continue;
 
-        // New untracked file — register as dirty
-        auto file_size = entry.file_size();
-        auto storage_key = make_storage_key(rel);
+        MDB_val k = {rel.size(), const_cast<char*>(rel.data())};
+        MDB_val v;
+        rc = mdb_get(rtxn, dbi_files_, &k, &v);
+        mdb_txn_abort(rtxn);
 
-        sqlite3_reset(stmt_insert_);
-        sqlite3_bind_text(stmt_insert_, 1, rel.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt_insert_, 2, static_cast<int64_t>(file_size));
-        sqlite3_bind_text(stmt_insert_, 3, storage_key.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_insert_, 4, "dirty", -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt_insert_, 5, now);
-        sqlite3_bind_int64(stmt_insert_, 6, now);
-        sqlite3_bind_null(stmt_insert_, 7);
-        sql_step_retry(stmt_insert_);
+        if (rc == 0) continue;  // Already tracked
 
-        cache_bytes_ += file_size;
-        ++found;
+        UntrackedFile uf;
+        uf.rel_path = rel;
+        uf.storage_key = make_storage_key(rel);
+        uf.file_size = entry.file_size();
+        untracked.push_back(std::move(uf));
     }
-    sql_exec(db_, "COMMIT");
+
+    if (untracked.empty()) return;
+
+    // Batch insert under write lock
+    {
+        std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+        if (rc) return;
+
+        for (auto& uf : untracked) {
+            FileEntry fe;
+            fe.size = uf.file_size;
+            fe.last_access = static_cast<uint64_t>(now);
+            fe.created_at = static_cast<uint64_t>(now);
+            fe.state = FileState::Dirty;
+            fe.storage_key = uf.storage_key;
+
+            auto val = encode_file_entry(fe);
+            MDB_val k = {uf.rel_path.size(), const_cast<char*>(uf.rel_path.data())};
+            MDB_val v = {val.size(), val.data()};
+            mdb_put(txn, dbi_files_, &k, &v, 0);
+
+            // Add to dirty_queue
+            auto dk = make_index_key(fe.created_at, uf.rel_path);
+            MDB_val dkv = {dk.size(), dk.data()};
+            MDB_val empty = {0, nullptr};
+            mdb_put(txn, dbi_dirty_, &dkv, &empty, 0);
+
+            cache_bytes_ += uf.file_size;
+            count_dirty_++;
+            ++found;
+        }
+
+        rc = mdb_txn_commit(txn);
+        if (rc) {
+            log_error("scan_untracked_files commit failed: %s", mdb_strerror(rc));
+        }
+    }
 
     if (found > 0) {
         log_info("Found %zu untracked files, registered as dirty", found);
     }
-}
-
-uint64_t DepotCache::calculate_cache_bytes() {
-    uint64_t total = 0;
-
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_,
-        "SELECT COALESCE(SUM(size), 0) FROM cache_entries WHERE state != 'evicted'",
-        -1, &stmt, nullptr);
-    if (sql_step_retry(stmt) == SQLITE_ROW) {
-        total = sqlite3_column_int64(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
-    return total;
 }
 
 // --- Path helpers ---
@@ -484,28 +611,65 @@ void DepotCache::on_file_written(const std::filesystem::path& path) {
     auto file_size = std::filesystem::file_size(path, ec);
     if (ec) return;  // File may have been deleted already
 
-    // Insert or update in manifest
     int64_t old_size = 0;
+    bool had_entry = false;
+    FileState old_state = FileState::Dirty;
+
     {
         std::lock_guard<std::mutex> db_lock(db_mutex_);
-        sqlite3_reset(stmt_get_entry_);
-        sqlite3_bind_text(stmt_get_entry_, 1, rel.c_str(), -1, SQLITE_TRANSIENT);
-        if (sql_step_retry(stmt_get_entry_) == SQLITE_ROW) {
-            old_size = sqlite3_column_int64(stmt_get_entry_, 1);
+
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+        if (rc) return;
+
+        MDB_val k = {rel.size(), const_cast<char*>(rel.data())};
+        MDB_val v;
+
+        // Check for existing entry
+        rc = mdb_get(txn, dbi_files_, &k, &v);
+        if (rc == 0) {
+            auto entry = decode_file_entry(v);
+            old_size = static_cast<int64_t>(entry.size);
+            old_state = entry.state;
+            had_entry = true;
+
+            // Remove old index entries
+            remove_indexes(txn, dbi_dirty_, dbi_evict_, rel, entry);
         }
 
-        sqlite3_reset(stmt_insert_);
-        sqlite3_bind_text(stmt_insert_, 1, rel.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt_insert_, 2, static_cast<int64_t>(file_size));
-        sqlite3_bind_text(stmt_insert_, 3, storage_key.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_insert_, 4, "dirty", -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt_insert_, 5, now);
-        sqlite3_bind_int64(stmt_insert_, 6, now);
-        sqlite3_bind_null(stmt_insert_, 7);
-        sql_step_retry(stmt_insert_);
+        // Create new entry as dirty
+        FileEntry new_entry;
+        new_entry.size = file_size;
+        new_entry.last_access = static_cast<uint64_t>(now);
+        new_entry.created_at = static_cast<uint64_t>(now);
+        new_entry.state = FileState::Dirty;
+        new_entry.storage_key = storage_key;
+
+        auto val = encode_file_entry(new_entry);
+        MDB_val nv = {val.size(), val.data()};
+        mdb_put(txn, dbi_files_, &k, &nv, 0);
+
+        // Add to dirty_queue
+        auto dk = make_index_key(new_entry.created_at, rel);
+        MDB_val dkv = {dk.size(), dk.data()};
+        MDB_val empty = {0, nullptr};
+        mdb_put(txn, dbi_dirty_, &dkv, &empty, 0);
+
+        rc = mdb_txn_commit(txn);
+        if (rc) return;
     }
 
-    cache_bytes_ -= old_size;
+    // Update in-memory counters
+    if (had_entry) {
+        switch (old_state) {
+            case FileState::Dirty: count_dirty_--; break;
+            case FileState::Uploading: count_uploading_--; break;
+            case FileState::Clean: count_clean_--; break;
+        }
+    }
+    count_dirty_++;
+
+    cache_bytes_ -= static_cast<uint64_t>(old_size);
     cache_bytes_ += file_size;
 
     // Wake up the upload coordinator
@@ -517,58 +681,48 @@ void DepotCache::on_file_written(const std::filesystem::path& path) {
 
 bool DepotCache::on_file_open(const std::filesystem::path& path) {
     auto rel = relative_path(path);
+    auto now = now_epoch();
 
-    // Check file size first (no DB access needed for warm reads)
-    std::error_code ec;
-    auto file_size = std::filesystem::file_size(path, ec);
-
-    // Update LRU timestamp
+    // Update LRU timestamp if tracked as clean
     {
         std::lock_guard<std::mutex> db_lock(db_mutex_);
-        auto now = now_epoch();
-        sqlite3_reset(stmt_update_access_);
-        sqlite3_bind_text(stmt_update_access_, 1, rel.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt_update_access_, 2, now);
-        sql_step_retry(stmt_update_access_);
-    }
 
-    if (ec || file_size > 0) {
-        return true;  // Normal file, allow immediately
-    }
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+        if (rc) return true;
 
-    // 0-byte file — check manifest for evicted state
-    std::string key_str;
-    std::string rel_str(rel);
-    {
-        std::lock_guard<std::mutex> db_lock(db_mutex_);
-        sqlite3_reset(stmt_get_entry_);
-        sqlite3_bind_text(stmt_get_entry_, 1, rel.c_str(), -1, SQLITE_TRANSIENT);
-        int rc = sql_step_retry(stmt_get_entry_);
-        if (rc != SQLITE_ROW) {
-            return true;  // Not tracked — might be legitimately empty
+        MDB_val k = {rel.size(), const_cast<char*>(rel.data())};
+        MDB_val v;
+        rc = mdb_get(txn, dbi_files_, &k, &v);
+        if (rc != 0) {
+            mdb_txn_abort(txn);
+            return true;  // Not tracked
         }
 
-        const char* state = reinterpret_cast<const char*>(sqlite3_column_text(stmt_get_entry_, 3));
-        if (!state || strcmp(state, "evicted") != 0) {
-            return true;  // Not evicted — allow
+        auto entry = decode_file_entry(v);
+
+        if (entry.state == FileState::Clean) {
+            // Remove old evict_order entry
+            auto old_ek = make_index_key(entry.last_access, rel);
+            MDB_val oek = {old_ek.size(), old_ek.data()};
+            mdb_del(txn, dbi_evict_, &oek, nullptr);
+
+            // Update entry with new access time
+            entry.last_access = static_cast<uint64_t>(now);
+            auto new_val = encode_file_entry(entry);
+            MDB_val nv = {new_val.size(), new_val.data()};
+            mdb_put(txn, dbi_files_, &k, &nv, 0);
+
+            // Add new evict_order entry
+            auto new_ek = make_index_key(entry.last_access, rel);
+            MDB_val nek = {new_ek.size(), new_ek.data()};
+            MDB_val empty = {0, nullptr};
+            mdb_put(txn, dbi_evict_, &nek, &empty, 0);
         }
 
-        const char* stored_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt_get_entry_, 2));
-        if (!stored_key) return true;
-        key_str = stored_key;
+        mdb_txn_commit(txn);
     }
 
-    if (config_.verbose) {
-        log_info("Restoring evicted file: %s", rel_str.c_str());
-    }
-
-    // Restore from storage synchronously (blocks the open until ready)
-    if (restore_file(rel_str, key_str)) {
-        return true;  // Restored successfully, allow the open
-    }
-
-    // Restore failed — allow the open anyway
-    log_error("Failed to restore evicted file: %s", rel_str.c_str());
     return true;
 }
 
@@ -593,34 +747,81 @@ void DepotCache::upload_worker_loop() {
         {
             std::lock_guard<std::mutex> db_lock(db_mutex_);
 
-            sqlite3_reset(stmt_get_dirty_batch_);
-            sqlite3_bind_int(stmt_get_dirty_batch_, 1, static_cast<int>(config_.upload_batch_size));
-            while (sql_step_retry(stmt_get_dirty_batch_) == SQLITE_ROW) {
-                auto col0 = sqlite3_column_text(stmt_get_dirty_batch_, 0);
-                auto col1 = sqlite3_column_text(stmt_get_dirty_batch_, 1);
-                if (!col0 || !col1) continue;
-                DirtyEntry e;
-                e.path = reinterpret_cast<const char*>(col0);
-                e.storage_key = reinterpret_cast<const char*>(col1);
-                batch.push_back(std::move(e));
+            MDB_txn* txn = nullptr;
+            int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+            if (rc) continue;
+
+            // Collect dirty entries from the dirty_queue index
+            MDB_cursor* cursor = nullptr;
+            rc = mdb_cursor_open(txn, dbi_dirty_, &cursor);
+            if (rc) { mdb_txn_abort(txn); continue; }
+
+            struct QueueEntry {
+                std::vector<uint8_t> index_key;  // For deletion
+                std::string path;
+            };
+            std::vector<QueueEntry> queue_entries;
+
+            MDB_val key, val;
+            MDB_cursor_op op = MDB_FIRST;
+            while (queue_entries.size() < config_.upload_batch_size &&
+                   mdb_cursor_get(cursor, &key, &val, op) == 0) {
+                op = MDB_NEXT;
+                if (key.mv_size <= 8) continue;
+
+                QueueEntry qe;
+                qe.index_key.assign(static_cast<uint8_t*>(key.mv_data),
+                                    static_cast<uint8_t*>(key.mv_data) + key.mv_size);
+                qe.path.assign(static_cast<const char*>(key.mv_data) + 8, key.mv_size - 8);
+                queue_entries.push_back(std::move(qe));
             }
+            mdb_cursor_close(cursor);
 
-            if (!batch.empty()) {
-                // Mark batch as 'uploading'
-                sqlite3_stmt* mark_stmt = nullptr;
-                sqlite3_prepare_v2(db_,
-                    "UPDATE cache_entries SET state = 'uploading' WHERE path = ?1 AND state = 'dirty'",
-                    -1, &mark_stmt, nullptr);
-
-                sql_exec(db_, "BEGIN IMMEDIATE");
-                for (auto& e : batch) {
-                    sqlite3_reset(mark_stmt);
-                    sqlite3_bind_text(mark_stmt, 1, e.path.c_str(), -1, SQLITE_TRANSIENT);
-                    sql_step_retry(mark_stmt);
+            // For each queue entry: verify it's still dirty, mark as uploading
+            for (auto& qe : queue_entries) {
+                MDB_val fk = {qe.path.size(), const_cast<char*>(qe.path.data())};
+                MDB_val fv;
+                rc = mdb_get(txn, dbi_files_, &fk, &fv);
+                if (rc != 0) {
+                    // Stale index entry — delete it
+                    MDB_val dk = {qe.index_key.size(), qe.index_key.data()};
+                    mdb_del(txn, dbi_dirty_, &dk, nullptr);
+                    continue;
                 }
-                sql_exec(db_, "COMMIT");
-                sqlite3_finalize(mark_stmt);
+
+                auto entry = decode_file_entry(fv);
+                if (entry.state != FileState::Dirty) {
+                    // Stale index entry — delete it
+                    MDB_val dk = {qe.index_key.size(), qe.index_key.data()};
+                    mdb_del(txn, dbi_dirty_, &dk, nullptr);
+                    continue;
+                }
+
+                // Mark as uploading
+                entry.state = FileState::Uploading;
+                auto new_val = encode_file_entry(entry);
+                MDB_val nv = {new_val.size(), new_val.data()};
+                mdb_put(txn, dbi_files_, &fk, &nv, 0);
+
+                // Delete from dirty_queue
+                MDB_val dk = {qe.index_key.size(), qe.index_key.data()};
+                mdb_del(txn, dbi_dirty_, &dk, nullptr);
+
+                DirtyEntry de;
+                de.path = qe.path;
+                de.storage_key = entry.storage_key;
+                batch.push_back(std::move(de));
             }
+
+            rc = mdb_txn_commit(txn);
+            if (rc) {
+                log_error("upload batch commit failed: %s", mdb_strerror(rc));
+                continue;
+            }
+
+            // Update counters
+            count_dirty_ -= batch.size();
+            count_uploading_ += batch.size();
         }
 
         if (batch.empty()) continue;
@@ -648,31 +849,75 @@ void DepotCache::upload_worker_loop() {
         // Update states in DB
         {
             std::lock_guard<std::mutex> db_lock(db_mutex_);
-            sqlite3_stmt* result_stmt = nullptr;
-            sqlite3_prepare_v2(db_,
-                "UPDATE cache_entries SET state = ?2 WHERE path = ?1",
-                -1, &result_stmt, nullptr);
 
-            sql_exec(db_, "BEGIN IMMEDIATE");
+            MDB_txn* txn = nullptr;
+            int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+            if (rc) continue;
+
+            size_t succeeded = 0, failed = 0;
+            auto now = now_epoch();
+
             for (size_t i = 0; i < results.size(); ++i) {
-                sqlite3_reset(result_stmt);
-                sqlite3_bind_text(result_stmt, 1, batch[i].path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(result_stmt, 2, results[i] ? "clean" : "dirty", -1, SQLITE_STATIC);
-                sql_step_retry(result_stmt);
+                auto& path = batch[i].path;
+                MDB_val fk = {path.size(), const_cast<char*>(path.data())};
+                MDB_val fv;
+                rc = mdb_get(txn, dbi_files_, &fk, &fv);
+                if (rc != 0) continue;
 
-                std::lock_guard lock(stats_mutex_);
+                auto entry = decode_file_entry(fv);
+
                 if (results[i]) {
-                    stats_.uploads_completed++;
+                    // Success: uploading → clean
+                    entry.state = FileState::Clean;
+                    entry.last_access = static_cast<uint64_t>(now);
+                    auto new_val = encode_file_entry(entry);
+                    MDB_val nv = {new_val.size(), new_val.data()};
+                    mdb_put(txn, dbi_files_, &fk, &nv, 0);
+
+                    // Add to evict_order
+                    auto ek = make_index_key(entry.last_access, path);
+                    MDB_val ekv = {ek.size(), ek.data()};
+                    MDB_val empty = {0, nullptr};
+                    mdb_put(txn, dbi_evict_, &ekv, &empty, 0);
+
+                    ++succeeded;
                 } else {
-                    stats_.uploads_failed++;
+                    // Failure: uploading → dirty
+                    entry.state = FileState::Dirty;
+                    entry.created_at = static_cast<uint64_t>(now);
+                    auto new_val = encode_file_entry(entry);
+                    MDB_val nv = {new_val.size(), new_val.data()};
+                    mdb_put(txn, dbi_files_, &fk, &nv, 0);
+
+                    // Add back to dirty_queue
+                    auto dk = make_index_key(entry.created_at, path);
+                    MDB_val dkv = {dk.size(), dk.data()};
+                    MDB_val empty = {0, nullptr};
+                    mdb_put(txn, dbi_dirty_, &dkv, &empty, 0);
+
+                    ++failed;
+                }
+
+                {
+                    std::lock_guard lock(stats_mutex_);
+                    if (results[i]) {
+                        stats_.uploads_completed++;
+                    } else {
+                        stats_.uploads_failed++;
+                    }
                 }
             }
-            sql_exec(db_, "COMMIT");
-            sqlite3_finalize(result_stmt);
-        }
 
-        // WAL checkpoint periodically
-        sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+            rc = mdb_txn_commit(txn);
+            if (rc) {
+                log_error("upload results commit failed: %s", mdb_strerror(rc));
+            }
+
+            // Update counters
+            count_uploading_ -= results.size();
+            count_clean_ += succeeded;
+            count_dirty_ += failed;
+        }
     }
 }
 
@@ -728,24 +973,47 @@ void DepotCache::eviction_worker_loop() {
                  cache_bytes_.load(), config_.eviction_target);
 
         while (running_.load() && cache_bytes_.load() > config_.eviction_target) {
-            // Fetch candidates: oldest clean files
+            // Phase 0: Fetch candidates (oldest clean files) — read-only, no mutex
             struct EvictCandidate {
                 std::string path;
-                int64_t size;
+                uint64_t size;
+                uint64_t last_access;
             };
             std::vector<EvictCandidate> candidates;
 
             {
-                std::lock_guard<std::mutex> db_lock(db_mutex_);
-                sqlite3_reset(stmt_get_evict_candidates_);
-                sqlite3_bind_int(stmt_get_evict_candidates_, 1, 100);
-                while (sql_step_retry(stmt_get_evict_candidates_) == SQLITE_ROW) {
+                MDB_txn* rtxn = nullptr;
+                int rc = mdb_txn_begin(mdb_env_, nullptr, MDB_RDONLY, &rtxn);
+                if (rc) break;
+
+                MDB_cursor* cursor = nullptr;
+                rc = mdb_cursor_open(rtxn, dbi_evict_, &cursor);
+                if (rc) { mdb_txn_abort(rtxn); break; }
+
+                MDB_val key, val;
+                MDB_cursor_op op = MDB_FIRST;
+                while (candidates.size() < 100 &&
+                       mdb_cursor_get(cursor, &key, &val, op) == 0) {
+                    op = MDB_NEXT;
+                    if (key.mv_size <= 8) continue;
+
                     EvictCandidate c;
-                    c.path = reinterpret_cast<const char*>(
-                        sqlite3_column_text(stmt_get_evict_candidates_, 0));
-                    c.size = sqlite3_column_int64(stmt_get_evict_candidates_, 1);
-                    candidates.push_back(std::move(c));
+                    c.last_access = decode_be64(static_cast<const uint8_t*>(key.mv_data));
+                    c.path.assign(static_cast<const char*>(key.mv_data) + 8, key.mv_size - 8);
+
+                    // Look up size from files DB
+                    MDB_val fk = {c.path.size(), const_cast<char*>(c.path.data())};
+                    MDB_val fv;
+                    rc = mdb_get(rtxn, dbi_files_, &fk, &fv);
+                    if (rc == 0) {
+                        auto entry = decode_file_entry(fv);
+                        c.size = entry.size;
+                        candidates.push_back(std::move(c));
+                    }
                 }
+
+                mdb_cursor_close(cursor);
+                mdb_txn_abort(rtxn);
             }
 
             if (candidates.empty()) {
@@ -753,38 +1021,69 @@ void DepotCache::eviction_worker_loop() {
                 break;
             }
 
-            // Evict: truncate files to 0 bytes, then update DB
-            std::vector<EvictCandidate> evicted;
+            // Phase 1: Delete files from disk (no lock needed)
+            struct EvictedFile {
+                std::string path;
+                uint64_t last_access;
+            };
+            std::vector<EvictedFile> unlinked;
+
             for (auto& c : candidates) {
                 auto full_path = config_.depot_path / c.path;
-                if (truncate(full_path.c_str(), 0) == 0) {
-                    evicted.push_back(c);
-                    cache_bytes_ -= c.size;
+                int rc = ::unlink(full_path.c_str());
+                if (rc == 0 || errno == ENOENT) {
+                    // Remove empty parent directories up to depot_path
+                    auto parent = full_path.parent_path();
+                    while (parent != config_.depot_path && parent.has_parent_path()) {
+                        if (::rmdir(parent.c_str()) != 0) break;
+                        parent = parent.parent_path();
+                    }
+                    unlinked.push_back({c.path, c.last_access});
+                }
+            }
+
+            // Phase 2: Delete DB entries (under write lock)
+            if (!unlinked.empty()) {
+                std::lock_guard<std::mutex> db_lock(db_mutex_);
+
+                MDB_txn* txn = nullptr;
+                int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+                if (rc) break;
+
+                for (auto& ef : unlinked) {
+                    MDB_val fk = {ef.path.size(), const_cast<char*>(ef.path.data())};
+                    MDB_val fv;
+                    rc = mdb_get(txn, dbi_files_, &fk, &fv);
+                    if (rc != 0) continue;  // Already deleted
+
+                    auto entry = decode_file_entry(fv);
+                    if (entry.state != FileState::Clean) continue;  // State changed, skip
+
+                    // Delete from files DB
+                    mdb_del(txn, dbi_files_, &fk, nullptr);
+
+                    // Delete from evict_order
+                    auto ek = make_index_key(entry.last_access, ef.path);
+                    MDB_val ekv = {ek.size(), ek.data()};
+                    mdb_del(txn, dbi_evict_, &ekv, nullptr);
+
+                    cache_bytes_ -= entry.size;
+                    count_clean_--;
+
                     {
                         std::lock_guard lock(stats_mutex_);
                         stats_.evictions_performed++;
                     }
+
                     if (config_.verbose) {
-                        log_info("Evicted: %s (%ld bytes)", c.path.c_str(), c.size);
+                        log_info("Evicted: %s (%lu bytes)", ef.path.c_str(), entry.size);
                     }
                 }
-            }
 
-            if (!evicted.empty()) {
-                std::lock_guard<std::mutex> db_lock(db_mutex_);
-                sqlite3_stmt* evict_stmt = nullptr;
-                sqlite3_prepare_v2(db_,
-                    "UPDATE cache_entries SET state = 'evicted', size = 0 WHERE path = ?1 AND state = 'clean'",
-                    -1, &evict_stmt, nullptr);
-
-                sql_exec(db_, "BEGIN IMMEDIATE");
-                for (auto& c : evicted) {
-                    sqlite3_reset(evict_stmt);
-                    sqlite3_bind_text(evict_stmt, 1, c.path.c_str(), -1, SQLITE_TRANSIENT);
-                    sql_step_retry(evict_stmt);
+                rc = mdb_txn_commit(txn);
+                if (rc) {
+                    log_error("eviction commit failed: %s", mdb_strerror(rc));
                 }
-                sql_exec(db_, "COMMIT");
-                sqlite3_finalize(evict_stmt);
             }
         }
 
@@ -837,20 +1136,36 @@ bool DepotCache::restore_file(const std::string& rel_path, const std::string& st
                         }
 
                         if (ok) {
-                            // Update manifest: state=clean, size=actual
+                            // Insert into manifest as clean
+                            auto now = now_epoch();
                             std::lock_guard<std::mutex> db_lock(db_mutex_);
-                            sqlite3_stmt* restore_stmt = nullptr;
-                            sqlite3_prepare_v2(db_,
-                                "UPDATE cache_entries SET state = 'clean', size = ?2, last_access = ?3 "
-                                "WHERE path = ?1",
-                                -1, &restore_stmt, nullptr);
-                            sqlite3_bind_text(restore_stmt, 1, path_copy.c_str(), -1, SQLITE_TRANSIENT);
-                            sqlite3_bind_int64(restore_stmt, 2, static_cast<int64_t>(get_result.data.size()));
-                            sqlite3_bind_int64(restore_stmt, 3, now_epoch());
-                            sql_step_retry(restore_stmt);
-                            sqlite3_finalize(restore_stmt);
+
+                            MDB_txn* txn = nullptr;
+                            int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+                            if (rc == 0) {
+                                FileEntry fe;
+                                fe.size = get_result.data.size();
+                                fe.last_access = static_cast<uint64_t>(now);
+                                fe.created_at = static_cast<uint64_t>(now);
+                                fe.state = FileState::Clean;
+                                fe.storage_key = key_copy;
+
+                                auto val = encode_file_entry(fe);
+                                MDB_val k = {path_copy.size(), const_cast<char*>(path_copy.data())};
+                                MDB_val v = {val.size(), val.data()};
+                                mdb_put(txn, dbi_files_, &k, &v, 0);
+
+                                // Add to evict_order
+                                auto ek = make_index_key(fe.last_access, path_copy);
+                                MDB_val ekv = {ek.size(), ek.data()};
+                                MDB_val empty = {0, nullptr};
+                                mdb_put(txn, dbi_evict_, &ekv, &empty, 0);
+
+                                mdb_txn_commit(txn);
+                            }
 
                             cache_bytes_ += get_result.data.size();
+                            count_clean_++;
                         }
                     }
                 } catch (const std::exception& e) {
@@ -878,7 +1193,7 @@ bool DepotCache::restore_file(const std::string& rel_path, const std::string& st
         }
     }
 
-    // Wait for the restore to complete (blocks the fanotify FAN_OPEN_PERM response)
+    // Wait for the restore to complete
     return future.get();
 }
 
@@ -897,16 +1212,22 @@ std::string DepotCache::fetch_for_shim(const std::string& relative_path) {
         }
     }
 
-    // Check manifest first for known storage key
+    // Check manifest for known storage key (read-only txn, no mutex)
     std::string storage_key;
     {
-        std::lock_guard<std::mutex> db_lock(db_mutex_);
-        sqlite3_reset(stmt_get_entry_);
-        sqlite3_bind_text(stmt_get_entry_, 1, relative_path.c_str(), -1, SQLITE_TRANSIENT);
-        int rc = sql_step_retry(stmt_get_entry_);
-        if (rc == SQLITE_ROW) {
-            storage_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt_get_entry_, 2));
-        } else {
+        MDB_txn* rtxn = nullptr;
+        int rc = mdb_txn_begin(mdb_env_, nullptr, MDB_RDONLY, &rtxn);
+        if (rc == 0) {
+            MDB_val k = {relative_path.size(), const_cast<char*>(relative_path.data())};
+            MDB_val v;
+            rc = mdb_get(rtxn, dbi_files_, &k, &v);
+            if (rc == 0) {
+                auto entry = decode_file_entry(v);
+                storage_key = entry.storage_key;
+            }
+            mdb_txn_abort(rtxn);
+        }
+        if (storage_key.empty()) {
             storage_key = make_storage_key(relative_path);
         }
     }
@@ -940,18 +1261,50 @@ std::string DepotCache::fetch_for_shim(const std::string& relative_path) {
     auto now = now_epoch();
     {
         std::lock_guard<std::mutex> db_lock(db_mutex_);
-        sqlite3_reset(stmt_insert_);
-        sqlite3_bind_text(stmt_insert_, 1, relative_path.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt_insert_, 2, static_cast<int64_t>(get_result.data.size()));
-        sqlite3_bind_text(stmt_insert_, 3, storage_key.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt_insert_, 4, "clean", -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt_insert_, 5, now);
-        sqlite3_bind_int64(stmt_insert_, 6, now);
-        sqlite3_bind_null(stmt_insert_, 7);
-        sql_step_retry(stmt_insert_);
+
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(mdb_env_, nullptr, 0, &txn);
+        if (rc == 0) {
+            // Check for existing entry to remove old indexes
+            MDB_val k = {relative_path.size(), const_cast<char*>(relative_path.data())};
+            MDB_val v;
+            rc = mdb_get(txn, dbi_files_, &k, &v);
+            if (rc == 0) {
+                auto old_entry = decode_file_entry(v);
+                remove_indexes(txn, dbi_dirty_, dbi_evict_, relative_path, old_entry);
+
+                // Adjust counters for old entry
+                switch (old_entry.state) {
+                    case FileState::Dirty: count_dirty_--; break;
+                    case FileState::Uploading: count_uploading_--; break;
+                    case FileState::Clean: count_clean_--; break;
+                }
+                cache_bytes_ -= old_entry.size;
+            }
+
+            FileEntry fe;
+            fe.size = get_result.data.size();
+            fe.last_access = static_cast<uint64_t>(now);
+            fe.created_at = static_cast<uint64_t>(now);
+            fe.state = FileState::Clean;
+            fe.storage_key = storage_key;
+
+            auto val = encode_file_entry(fe);
+            MDB_val nv = {val.size(), val.data()};
+            mdb_put(txn, dbi_files_, &k, &nv, 0);
+
+            // Add to evict_order
+            auto ek = make_index_key(fe.last_access, relative_path);
+            MDB_val ekv = {ek.size(), ek.data()};
+            MDB_val empty = {0, nullptr};
+            mdb_put(txn, dbi_evict_, &ekv, &empty, 0);
+
+            mdb_txn_commit(txn);
+        }
     }
 
     cache_bytes_ += get_result.data.size();
+    count_clean_++;
     {
         std::lock_guard lock(stats_mutex_);
         stats_.shim_fetches++;
@@ -1056,32 +1409,20 @@ void DepotCache::stats_reporter_loop() {
         }
         if (!running_.load()) break;
 
-        // Query manifest stats
-        uint64_t dirty = 0, uploading = 0, clean = 0, evicted = 0, total = 0;
-        {
-            std::lock_guard<std::mutex> db_lock(db_mutex_);
-            sqlite3_reset(stmt_get_stats_);
-            while (sql_step_retry(stmt_get_stats_) == SQLITE_ROW) {
-                const char* state = reinterpret_cast<const char*>(sqlite3_column_text(stmt_get_stats_, 0));
-                uint64_t count = sqlite3_column_int64(stmt_get_stats_, 1);
-                total += count;
-                if (state) {
-                    if (strcmp(state, "dirty") == 0) dirty = count;
-                    else if (strcmp(state, "uploading") == 0) uploading = count;
-                    else if (strcmp(state, "clean") == 0) clean = count;
-                    else if (strcmp(state, "evicted") == 0) evicted = count;
-                }
-            }
-        }
+        // Read in-memory counters (no DB query needed)
+        uint64_t dirty = count_dirty_.load();
+        uint64_t uploading = count_uploading_.load();
+        uint64_t clean = count_clean_.load();
+        uint64_t total = dirty + uploading + clean;
 
         auto s = get_stats();
         double cache_gb = static_cast<double>(cache_bytes_.load()) / (1024.0 * 1024 * 1024);
         double max_gb = static_cast<double>(config_.max_cache_bytes) / (1024.0 * 1024 * 1024);
 
         log_info("[stats] cache=%.1f/%.1f GB | files: %lu total, %lu dirty, %lu uploading, "
-                 "%lu clean, %lu evicted | uploads: %lu ok, %lu fail | restores: %lu ok, "
+                 "%lu clean | uploads: %lu ok, %lu fail | restores: %lu ok, "
                  "%lu fail (%lu secondary) | evictions: %lu | shim: %lu fetch, %lu miss",
-                 cache_gb, max_gb, total, dirty, uploading, clean, evicted,
+                 cache_gb, max_gb, total, dirty, uploading, clean,
                  s.uploads_completed, s.uploads_failed,
                  s.restores_completed, s.restores_failed, s.secondary_restores,
                  s.evictions_performed,

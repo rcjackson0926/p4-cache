@@ -22,7 +22,6 @@
 #include <mutex>
 #include <string>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <unordered_set>
@@ -143,8 +142,8 @@ void ensure_initialized() {
     initialized = true;
 }
 
-/// Check if this path is under our depot (for both ENOENT and stub detection).
-bool is_depot_path(const char* pathname) {
+/// Check if this path should be intercepted on ENOENT.
+bool should_intercept(const char* pathname) {
     if (!depot_path || depot_path_len == 0) return false;
     if (!pathname) return false;
 
@@ -162,37 +161,11 @@ bool is_depot_path(const char* pathname) {
         return false;
     }
 
-    return true;
-}
-
-/// Check if this path should be intercepted on ENOENT.
-bool should_intercept(const char* pathname) {
-    if (!is_depot_path(pathname)) return false;
-
     // Check negative cache
     auto& cache = get_negative_cache();
     if (cache.count(pathname)) return false;
 
     return true;
-}
-
-/// Check if an open fd is a 0-byte evicted stub that needs restoration.
-/// Returns true if the file was restored and the fd should be re-opened.
-bool check_and_restore_stub(int fd, const char* pathname) {
-    if (!is_depot_path(pathname)) return false;
-
-    // Check file size via fstat
-    struct stat st;
-    if (fstat(fd, &st) != 0) return false;
-    if (st.st_size != 0) return false;       // Has content, not a stub
-    if (!S_ISREG(st.st_mode)) return false;  // Not a regular file
-
-    // 0-byte regular file under depot — ask daemon to restore
-    if (request_fetch(pathname)) {
-        return true;  // Restored — caller should re-open
-    }
-
-    return false;
 }
 
 void add_to_negative_cache(const char* pathname) {
@@ -221,19 +194,8 @@ extern "C" int open(const char* pathname, int flags, ...) {
     // Try the real open first
     int fd = real_open(pathname, flags, mode);
 
-    if (fd >= 0) {
-        // Success — but check if it's a 0-byte evicted stub
-        // Only check read-only opens (write opens to stubs are normal)
-        if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC))) {
-            if (check_and_restore_stub(fd, pathname)) {
-                close(fd);
-                return real_open(pathname, flags, mode);
-            }
-        }
-        return fd;
-    }
-
-    if (errno != ENOENT) return fd;
+    if (fd >= 0) return fd;           // File exists — fast path
+    if (errno != ENOENT) return fd;   // Non-ENOENT error — pass through
 
     // ENOENT — check if we should intercept
     if (!should_intercept(pathname)) {
@@ -267,31 +229,8 @@ extern "C" int openat(int dirfd, const char* pathname, int flags, ...) {
 
     int fd = real_openat(dirfd, pathname, flags, mode);
 
-    if (fd >= 0) {
-        // Success — check for evicted stub (read-only opens only)
-        if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC))) {
-            // Resolve to absolute path for depot path check
-            const char* check_path = pathname;
-            std::string resolved;
-            if (pathname[0] != '/') {
-                if (dirfd == AT_FDCWD) {
-                    char cwd[PATH_MAX];
-                    if (getcwd(cwd, sizeof(cwd))) {
-                        resolved = std::string(cwd) + "/" + pathname;
-                        check_path = resolved.c_str();
-                    }
-                }
-                // For non-AT_FDCWD relative paths, skip stub check
-            }
-            if (check_path[0] == '/' && check_and_restore_stub(fd, check_path)) {
-                close(fd);
-                return real_openat(dirfd, pathname, flags, mode);
-            }
-        }
-        return fd;
-    }
-
-    if (errno != ENOENT) return fd;
+    if (fd >= 0) return fd;           // File exists — fast path
+    if (errno != ENOENT) return fd;   // Non-ENOENT error — pass through
 
     // Only intercept absolute paths or paths relative to AT_FDCWD
     if (pathname[0] != '/' && dirfd != AT_FDCWD) {

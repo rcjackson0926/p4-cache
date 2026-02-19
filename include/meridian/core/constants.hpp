@@ -28,6 +28,7 @@ constexpr int DEFAULT_LDAP_SEARCH_TIMEOUT_SECONDS = 60;
 // Storage defaults
 constexpr size_t DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024;        // 5MB
 constexpr size_t DEFAULT_MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024;       // 8MB
+constexpr size_t DEFAULT_UPLOAD_CONCURRENCY = 8;
 constexpr size_t DEFAULT_LARGE_FILE_THRESHOLD = 100 * 1024 * 1024;     // 100MB
 constexpr size_t DEFAULT_STREAM_BUFFER_SIZE = 8 * 1024 * 1024;         // 8MB
 constexpr size_t DEFAULT_BINARY_CHECK_SIZE = 8192;                      // 8KB

@@ -8,15 +8,15 @@ A transparent NVMe caching daemon for Perforce depot servers. `p4-cache` sits be
 P4d  ──reads/writes──>  NVMe depot  <──watches──  p4-cache daemon  ──uploads──>  Remote Storage
                              ^                          |                        (S3/Azure/GCS/NFS)
                              |                          |
-                        libp4shim.so               SQLite manifest
-                      (restores cold files)        (.p4cache/manifest.db)
+                        libp4shim.so               LMDB manifest
+                      (restores cold files)        (.p4cache/manifest.lmdb/)
 ```
 
 1. **P4d writes a file** to the NVMe depot at full disk speed.
 2. **`p4-cache` detects the write** via Linux fanotify (`FAN_CLOSE_WRITE`), marks it dirty in the manifest, and queues it for upload.
 3. **Background upload workers** push the file to the primary storage backend.
-4. **When the NVMe cache fills up**, the eviction thread truncates the oldest clean files to 0-byte stubs.
-5. **When P4d reads an evicted stub**, the `libp4shim.so` LD_PRELOAD shim detects the 0-byte file via `fstat()`, asks the daemon to restore it from remote storage, then retries the open.
+4. **When the NVMe cache fills up**, the eviction thread deletes the oldest clean files.
+5. **When P4d reads an evicted file**, the `libp4shim.so` LD_PRELOAD shim intercepts the ENOENT, asks the daemon to restore it from remote storage, then retries the open.
 
 ## Supported Backends
 
@@ -79,7 +79,7 @@ p4-cache \
 |----------|-------------|
 | [Operations Guide](docs/p4-cache-guide.md) | Quick reference for CLI flags, JSON config, and backend examples |
 | [Configuration Reference](docs/configuration.md) | Complete reference for all CLI flags, JSON fields, environment variables, and defaults |
-| [Architecture](docs/architecture.md) | Internal design, component interactions, data flow, threading model, and SQLite schema |
+| [Architecture](docs/architecture.md) | Internal design, component interactions, data flow, threading model, and LMDB schema |
 | [Deployment Guide](docs/deployment.md) | Production deployment with systemd, permissions, monitoring, replica setup, and troubleshooting |
 
 ## Requirements
@@ -87,4 +87,4 @@ p4-cache \
 - Linux (fanotify requires `CAP_SYS_ADMIN`)
 - C++20 compiler (GCC 11+ or Clang 14+)
 - CMake 3.20+
-- SQLite3, OpenSSL, zlib, libcurl, nlohmann/json
+- LMDB, OpenSSL, zlib, libcurl, nlohmann/json

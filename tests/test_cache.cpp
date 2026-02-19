@@ -545,7 +545,7 @@ static void test_depot_cache_integration() {
         ASSERT_EMPTY(err, "start should succeed");
 
         // Verify state directory was created
-        ASSERT_TRUE(fs::exists(cfg.state_dir / "manifest.db"), "manifest.db should exist");
+        ASSERT_TRUE(fs::is_directory(cfg.state_dir / "manifest"), "manifest directory should exist");
         // Shim socket is created by a background thread, wait for it
         bool sock_ready = wait_for([&]{ return fs::exists(cfg.state_dir / "shim.sock"); }, 3000);
         ASSERT_TRUE(sock_ready, "shim.sock should exist");
@@ -860,26 +860,20 @@ static void test_depot_cache_integration() {
         }, 10000);
         ASSERT_TRUE(big_uploaded, "big file should upload");
 
-        // Wait for eviction to happen (evict1 or evict2 should become 0-byte)
+        // Wait for eviction to happen (evict1 or evict2 should be deleted)
         bool evicted = wait_for([&] {
-            std::error_code ec;
-            auto s1 = fs::file_size(f1, ec);
-            if (ec) return false;
-            auto s2 = fs::file_size(f2, ec);
-            if (ec) return false;
-            return s1 == 0 || s2 == 0;
+            return !fs::exists(f1) || !fs::exists(f2);
         }, 15000);
-        ASSERT_TRUE(evicted, "at least one file should be evicted to 0-byte stub");
+        ASSERT_TRUE(evicted, "at least one file should be evicted (deleted)");
 
         auto stats = cache.get_stats();
         ASSERT_TRUE(stats.evictions_performed >= 1, "should have >= 1 eviction");
 
         // Now restore an evicted file via fetch_for_shim
-        // Find which file was evicted
-        std::error_code ec;
+        // Find which file was evicted (deleted)
         std::string evicted_rel;
         std::string expected_content;
-        if (fs::file_size(f1, ec) == 0) {
+        if (!fs::exists(f1)) {
             evicted_rel = "evict1.dat";
             expected_content = data1;
         } else {
