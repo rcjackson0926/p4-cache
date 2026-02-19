@@ -963,13 +963,15 @@ if [ -n "$P4CACHE_PID" ] && [ -n "$S3_DEPOT_ROOT" ]; then
         echo "--- p4-cache Prometheus Metrics ---"
         echo ""
 
-        # Helper: extract a single metric value by name (ignoring comments/TYPE/HELP lines)
+        # Helper: extract a single metric value by name (ignoring comments/TYPE/HELP lines).
+        # All metrics carry constant labels (depot, mode), so match name followed by
+        # either '{' (has labels) or ' ' (bare metric).
         prom_val() {
             local name="$1" labels="${2:-}"
             if [ -n "$labels" ]; then
                 grep "^${name}{.*${labels}" "$PROM_FILE" 2>/dev/null | head -1 | awk '{print $NF}'
             else
-                grep "^${name} " "$PROM_FILE" 2>/dev/null | head -1 | awk '{print $NF}'
+                grep "^${name}[{ ]" "$PROM_FILE" 2>/dev/null | head -1 | awk '{print $NF}'
             fi
         }
 
