@@ -266,10 +266,11 @@ s3_delete_prefix() {
 # --- Cleanup helpers ----------------------------------------------
 
 # Remove leftover test directories, NFS depot data, and S3 objects.
-# Called both at startup (to clear stale data from previous runs) and
-# at exit via the trap.
+# Called at startup to clear stale data from previous runs.
+# The EXIT trap uses cleanup() which only removes the current run's P4ROOT.
 clean_test_artifacts() {
-    # Remove any old p4root dirs left by previous runs
+    # Remove any old p4root dirs left by previous runs.
+    # Use a lock file to prevent races between concurrent benchmark runs.
     for d in "$TESTDIR"/p4root.*; do
         [ -d "$d" ] && rm -rf "$d" && echo "  Removed stale p4root: $d"
     done
@@ -361,7 +362,35 @@ cleanup() {
         echo "  Removed p4d root: $P4ROOT"
     fi
 
-    clean_test_artifacts
+    # Remove S3 depot data directory (current run only)
+    if [ -n "$S3_DEPOT_ROOT" ] && [ -d "$S3_DEPOT_ROOT" ]; then
+        rm -rf "$S3_DEPOT_ROOT"
+        echo "  Removed S3 depot data: $S3_DEPOT_ROOT"
+    fi
+
+    # Remove generated test data
+    if [ -d "$TESTDIR/testdata" ]; then
+        rm -rf "$TESTDIR/testdata"
+        echo "  Removed test data."
+    fi
+
+    # Remove workspace directories
+    for backend in "${BACKEND_LIST[@]}"; do
+        if [ -d "$TESTDIR/ws-${backend}" ]; then
+            rm -rf "$TESTDIR/ws-${backend}"
+            echo "  Removed workspace: ws-${backend}"
+        fi
+    done
+
+    # Clean S3 objects
+    for backend in "${BACKEND_LIST[@]}"; do
+        if [ "$backend" = "s3" ]; then
+            local s3_depot
+            s3_depot=$(depot_for s3)
+            echo "  Cleaning S3 objects (bucket: $S3_BUCKET, prefix: $s3_depot/) ..."
+            s3_delete_prefix "$s3_depot/"
+        fi
+    done
 
     echo "Cleanup complete.  Results preserved at $RESULTS_FILE"
     exit $rc

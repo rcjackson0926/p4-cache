@@ -604,6 +604,18 @@ void DepotCache::on_file_written(const std::filesystem::path& path) {
     if (config_.read_only) return;  // Should not happen, but guard
 
     auto rel = relative_path(path);
+
+    // Skip p4d temporary files. During submit, p4d creates temp files like
+    // "file.bin,d/tmp.PID.TID.SEQ" and then renames them to the final revision
+    // (e.g. "1.1.gz"). The rename target will also fire FAN_CLOSE_WRITE and
+    // get uploaded correctly, so we can safely skip the temp file.
+    {
+        auto fname = path.filename().string();
+        if (fname.size() > 4 && fname.compare(0, 4, "tmp.") == 0) {
+            return;
+        }
+    }
+
     auto storage_key = make_storage_key(rel);
     auto now = now_epoch();
 
@@ -882,20 +894,37 @@ void DepotCache::upload_worker_loop() {
 
                     ++succeeded;
                 } else {
-                    // Failure: uploading → dirty
-                    entry.state = FileState::Dirty;
-                    entry.created_at = static_cast<uint64_t>(now);
-                    auto new_val = encode_file_entry(entry);
-                    MDB_val nv = {new_val.size(), new_val.data()};
-                    mdb_put(txn, dbi_files_, &fk, &nv, 0);
+                    // Check if file still exists on disk. If it was deleted
+                    // or renamed (e.g. p4d temp file), don't retry — remove
+                    // the entry entirely to avoid an infinite retry loop.
+                    auto full = config_.depot_path / path;
+                    std::error_code fec;
+                    bool exists = std::filesystem::exists(full, fec);
 
-                    // Add back to dirty_queue
-                    auto dk = make_index_key(entry.created_at, path);
-                    MDB_val dkv = {dk.size(), dk.data()};
-                    MDB_val empty = {0, nullptr};
-                    mdb_put(txn, dbi_dirty_, &dkv, &empty, 0);
+                    if (!exists) {
+                        // File gone: remove from manifest entirely
+                        mdb_del(txn, dbi_files_, &fk, nullptr);
+                        log_info("Upload: file removed from disk, dropping: %s",
+                                 path.c_str());
+                        // count as succeeded for counter purposes (not dirty)
+                        ++succeeded;
+                    } else {
+                        // File exists but upload failed (network error etc.):
+                        // re-queue for retry
+                        entry.state = FileState::Dirty;
+                        entry.created_at = static_cast<uint64_t>(now);
+                        auto new_val = encode_file_entry(entry);
+                        MDB_val nv = {new_val.size(), new_val.data()};
+                        mdb_put(txn, dbi_files_, &fk, &nv, 0);
 
-                    ++failed;
+                        // Add back to dirty_queue
+                        auto dk = make_index_key(entry.created_at, path);
+                        MDB_val dkv = {dk.size(), dk.data()};
+                        MDB_val empty = {0, nullptr};
+                        mdb_put(txn, dbi_dirty_, &dkv, &empty, 0);
+
+                        ++failed;
+                    }
                 }
 
                 {
