@@ -108,6 +108,8 @@ Upload concurrency (concurrent PUT operations per upload cycle) defaults to 16 a
 | `--pid-file <path>` | — | Write PID to file (removed on clean shutdown) |
 | `--log-file <path>` | — | Redirect stdout and stderr to file (append mode) |
 | `--stats-interval <secs>` | 60 | How often to log aggregate stats. Set to 0 to disable. |
+| `--metrics-file <path>` | — | Write Prometheus metrics to this `.prom` file (for node_exporter textfile collector) |
+| `--metrics-interval <secs>` | 15 | How often to write the `.prom` file |
 | `--config <path>` | — | Load a JSON configuration file (see below) |
 
 ## JSON Configuration
@@ -144,7 +146,9 @@ Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaul
   "upload_concurrency": 16,
   "restore_threads": 16,
   "verbose": false,
-  "stats_interval": 60
+  "stats_interval": 60,
+  "metrics_file": "/var/lib/node_exporter/textfile/p4cache.prom",
+  "metrics_interval": 15
 }
 ```
 
@@ -163,6 +167,8 @@ Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaul
 | `restore_threads` | integer | Restore worker thread count |
 | `verbose` | bool | Verbose logging |
 | `stats_interval` | integer | Stats log interval in seconds |
+| `metrics_file` | string | Path to `.prom` file for Prometheus textfile collector |
+| `metrics_interval` | integer | Metrics write interval in seconds (default 15) |
 
 ### Backend Object Fields
 
@@ -208,6 +214,7 @@ Any key can be specified in the backend object — the params map is passed dire
 | `upload_poll_interval` | 100 ms |
 | `restore_threads` | 16 |
 | `stats_interval_secs` | 60 |
+| `metrics_interval_secs` | 15 |
 
 ## Validation Rules
 

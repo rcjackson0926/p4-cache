@@ -104,7 +104,9 @@ Create `/etc/p4-cache/config.json`:
   "upload_threads": 8,
   "upload_concurrency": 16,
   "restore_threads": 16,
-  "stats_interval": 60
+  "stats_interval": 60,
+  "metrics_file": "/var/lib/node_exporter/textfile/p4cache.prom",
+  "metrics_interval": 15
 }
 ```
 
@@ -237,6 +239,49 @@ The daemon logs stats at the configured interval (default 60s):
 ```
 
 Note: stats are maintained as in-memory atomic counters (no DB query needed). The "evicted" count is not shown because evicted files are deleted from the manifest entirely.
+
+### Prometheus Metrics
+
+p4-cache can export metrics to a `.prom` textfile for node_exporter's textfile collector. No HTTP server is required.
+
+**Enable metrics** by adding `--metrics-file` to the CLI or `metrics_file` to the JSON config:
+
+```bash
+p4-cache --config /etc/p4-cache/config.json \
+  --metrics-file /var/lib/node_exporter/textfile/p4cache.prom \
+  --metrics-interval 15
+```
+
+Or in the JSON config:
+```json
+{
+  "metrics_file": "/var/lib/node_exporter/textfile/p4cache.prom",
+  "metrics_interval": 15
+}
+```
+
+**Configure node_exporter:**
+```bash
+node_exporter --collector.textfile.directory=/var/lib/node_exporter/textfile/
+```
+
+**Verify output:**
+```bash
+cat /var/lib/node_exporter/textfile/p4cache.prom
+# promtool check metrics < /var/lib/node_exporter/textfile/p4cache.prom
+```
+
+**Exported metrics:**
+
+| Type | Metrics |
+|------|---------|
+| Counters | `p4cache_uploads_total{result}`, `p4cache_upload_bytes_total`, `p4cache_restores_total{result}`, `p4cache_restore_bytes_total`, `p4cache_restores_secondary_total`, `p4cache_evictions_total`, `p4cache_eviction_bytes_total`, `p4cache_shim_requests_total{result}`, `p4cache_watcher_events_total{type}` |
+| Gauges | `p4cache_files_dirty`, `p4cache_files_uploading`, `p4cache_files_clean`, `p4cache_files_total`, `p4cache_cache_bytes`, `p4cache_cache_max_bytes`, `p4cache_upload_queue_pending`, `p4cache_restore_queue_pending` |
+| Histograms | `p4cache_upload_duration_seconds`, `p4cache_restore_duration_seconds`, `p4cache_eviction_batch_duration_seconds`, `p4cache_shim_request_duration_seconds` |
+
+All metrics carry constant labels: `depot` (depot path) and `mode` (`readwrite` or `readonly`).
+
+The file is written atomically (temp + rename) so readers never see partial content.
 
 ### Key Metrics to Watch
 

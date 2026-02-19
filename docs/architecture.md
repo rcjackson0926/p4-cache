@@ -48,9 +48,17 @@ Since evicted files are deleted (not truncated to 0-byte stubs), the hot path fo
 
 The shim maintains a per-thread negative cache (up to 10,000 entries) to avoid repeated lookups for paths not in storage.
 
-### 5. main.cpp
+### 5. MetricsExporter (`metrics.hpp` / `metrics.cpp`)
 
-Entry point. Handles daemonization (double-fork), log redirection, signal handling (SIGINT/SIGTERM), and orchestrates startup/shutdown of `DepotCache` and `DepotWatcher`.
+Optional Prometheus metrics exporter. When `--metrics-file` is set, creates a `prometheus::Registry` with counters, gauges, and histograms for all cache operations. A background writer thread periodically serializes the registry to a `.prom` textfile using atomic temp+rename, suitable for node_exporter's textfile collector.
+
+Key classes:
+- **`MetricsExporter`** — owns the registry, all metric families, and the writer thread. Receives pointers to `DepotCache` and `DepotWatcher` for periodic gauge snapshots.
+- **`ScopedTimer`** — RAII class that observes a histogram with elapsed duration on destruction. Used to instrument upload, restore, eviction, and shim request durations.
+
+### 6. main.cpp
+
+Entry point. Handles daemonization (double-fork), log redirection, signal handling (SIGINT/SIGTERM), and orchestrates startup/shutdown of `DepotCache`, `DepotWatcher`, and `MetricsExporter`.
 
 ## Data Flow
 
@@ -141,6 +149,7 @@ Eviction deletes files entirely — no 0-byte stubs, no "evicted" state. This av
 | Shim server | both | Accepts Unix socket connections, dispatches to restore pool |
 | Restore pool (N threads) | both | Concurrent GET + file write operations (`restore_threads`, default 16) |
 | Stats reporter | both | Logs stats every `stats_interval_secs` (default 60) |
+| Metrics writer | both (if configured) | Writes `.prom` file every `metrics_interval_secs` (default 15) |
 | Watcher event loop | read-write only | Reads fanotify events, calls `on_file_written()` |
 
 ### Concurrency Design

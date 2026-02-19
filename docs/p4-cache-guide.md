@@ -87,6 +87,8 @@ Uploads go to primary only. Restores try primary first, then secondary.
 | `--pid-file <path>` | PID file for daemon mode |
 | `--log-file <path>` | Log file (append mode) |
 | `--stats-interval <secs>` | Stats logging interval (default: 60) |
+| `--metrics-file <path>` | Prometheus `.prom` file for node_exporter |
+| `--metrics-interval <secs>` | Metrics write interval (default: 15) |
 | `--config <path>` | JSON config file |
 | `--primary-prefix <prefix>` | Storage key prefix (default: depot dir name) |
 | `--primary-no-verify-ssl` | Disable SSL verification |
@@ -162,6 +164,30 @@ echo "FETCH test" | socat - UNIX-CONNECT:/mnt/nvme/depot/.p4cache/shim.sock
 # Check manifest stats (use mdb_stat from lmdb-utils)
 mdb_stat -a /mnt/nvme/depot/.p4cache/manifest.lmdb
 ```
+
+## Prometheus Metrics
+
+Enable Prometheus metrics via the textfile collector (no HTTP server needed):
+
+```bash
+p4-cache \
+  --depot-path /p4/depot \
+  --primary-type s3 --primary-bucket my-depot \
+  --metrics-file /var/lib/node_exporter/textfile/p4cache.prom \
+  --metrics-interval 15
+```
+
+Configure node_exporter to pick up the file:
+```bash
+node_exporter --collector.textfile.directory=/var/lib/node_exporter/textfile/
+```
+
+Verify the output:
+```bash
+cat /var/lib/node_exporter/textfile/p4cache.prom
+```
+
+Exported metrics include counters (uploads, restores, evictions, shim requests), gauges (file states, cache size, queue depths), and histograms (operation durations). All metrics carry `depot` and `mode` labels.
 
 ## Operational Recommendations
 
