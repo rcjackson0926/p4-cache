@@ -56,6 +56,20 @@ else()
     message(STATUS "nlohmann/json fetched")
 endif()
 
+# prometheus-cpp (core only — textfile serialization, no HTTP server)
+include(FetchContent)
+FetchContent_Declare(
+    prometheus_cpp
+    GIT_REPOSITORY https://github.com/jupp0r/prometheus-cpp.git
+    GIT_TAG v1.3.0
+)
+set(ENABLE_PUSH OFF CACHE BOOL "" FORCE)
+set(ENABLE_PULL OFF CACHE BOOL "" FORCE)
+set(ENABLE_COMPRESSION OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(GENERATE_PKGCONFIG OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(prometheus_cpp)
+
 # ---- p4-cache daemon ----
 
 add_executable(p4-cache
@@ -65,6 +79,7 @@ add_executable(p4-cache
     src/depot_watcher.cpp
     src/storage_backend.cpp
     src/http_client.cpp
+    src/metrics.cpp
 )
 
 target_include_directories(p4-cache PRIVATE
@@ -80,6 +95,7 @@ target_link_libraries(p4-cache PRIVATE
     CURL::libcurl
     nlohmann_json::nlohmann_json
     ${LMDB_LIBRARY}
+    prometheus-cpp::core
 )
 
 # ---- LD_PRELOAD shim library ----
@@ -100,6 +116,7 @@ add_executable(test-p4-cache
     src/depot_watcher.cpp
     src/storage_backend.cpp
     src/http_client.cpp
+    src/metrics.cpp
 )
 
 target_include_directories(test-p4-cache PRIVATE
@@ -115,6 +132,7 @@ target_link_libraries(test-p4-cache PRIVATE
     CURL::libcurl
     nlohmann_json::nlohmann_json
     ${LMDB_LIBRARY}
+    prometheus-cpp::core
 )
 
 # ---- Install ----

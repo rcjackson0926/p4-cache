@@ -16,6 +16,7 @@
 
 #include "p4cache/cache_config.hpp"
 #include "p4cache/depot_cache.hpp"
+#include "p4cache/metrics.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -1127,6 +1128,156 @@ static void test_azure_key_sanitization() {
 }
 
 // ---------------------------------------------------------------------------
+// 7. Metrics tests
+// ---------------------------------------------------------------------------
+
+static void test_metrics() {
+    std::cout << "\n=== Metrics ===" << std::endl;
+
+    auto tmpdir = make_temp_dir("p4cache-metrics");
+    auto prom_path = tmpdir / "test.prom";
+
+    {
+        TEST(creates_prom_file);
+        std::map<std::string, std::string> labels = {
+            {"depot", "/test/depot"},
+            {"mode", "readwrite"},
+        };
+        MetricsExporter exporter(prom_path, std::chrono::seconds(1), labels);
+        exporter.start();
+
+        // Wait for at least one write cycle
+        bool created = wait_for([&]{ return fs::exists(prom_path); }, 5000);
+        exporter.stop();
+
+        ASSERT_TRUE(created, ".prom file should be created");
+        auto content = read_file(prom_path);
+        ASSERT_TRUE(!content.empty(), ".prom file should not be empty");
+        // Verify it contains expected metric names
+        ASSERT_TRUE(content.find("p4cache_uploads_total") != std::string::npos,
+                     "should contain p4cache_uploads_total");
+        ASSERT_TRUE(content.find("p4cache_files_dirty") != std::string::npos,
+                     "should contain p4cache_files_dirty");
+        ASSERT_TRUE(content.find("p4cache_upload_duration_seconds") != std::string::npos,
+                     "should contain p4cache_upload_duration_seconds");
+        PASS();
+    }
+
+    // Clean up for next test
+    fs::remove(prom_path);
+
+    {
+        TEST(counter_increments_appear);
+        std::map<std::string, std::string> labels = {
+            {"depot", "/test"},
+            {"mode", "readwrite"},
+        };
+        MetricsExporter exporter(prom_path, std::chrono::seconds(60), labels);
+
+        // Increment some counters
+        exporter.uploads_success().Increment();
+        exporter.uploads_success().Increment();
+        exporter.uploads_failure().Increment();
+        exporter.upload_bytes_total().Increment(12345);
+        exporter.shim_fetched().Increment();
+        exporter.evictions_total().Increment(5);
+
+        // Force a write (stop writes final snapshot)
+        exporter.stop();
+
+        auto content = read_file(prom_path);
+        // Check that counter values appear
+        ASSERT_TRUE(content.find("p4cache_uploads_total{") != std::string::npos,
+                     "should contain uploads counter");
+        // The success counter should show 2
+        ASSERT_TRUE(content.find("result=\"success\"") != std::string::npos,
+                     "should contain success label");
+        PASS();
+    }
+
+    fs::remove(prom_path);
+
+    {
+        TEST(scoped_timer_records_duration);
+        std::map<std::string, std::string> labels;
+        MetricsExporter exporter(prom_path, std::chrono::seconds(60), labels);
+
+        // Use ScopedTimer to record a duration
+        {
+            ScopedTimer timer(exporter.upload_duration());
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        exporter.stop();
+
+        auto content = read_file(prom_path);
+        // Histogram should have at least one observation
+        ASSERT_TRUE(content.find("p4cache_upload_duration_seconds_count") != std::string::npos,
+                     "should contain histogram count");
+        // The count should be 1
+        ASSERT_TRUE(content.find("p4cache_upload_duration_seconds_count 1") != std::string::npos,
+                     "histogram count should be 1");
+        PASS();
+    }
+
+    fs::remove(prom_path);
+
+    {
+        TEST(atomic_rename_no_partial_reads);
+        std::map<std::string, std::string> labels;
+        MetricsExporter exporter(prom_path, std::chrono::seconds(1), labels);
+
+        exporter.uploads_success().Increment();
+        exporter.start();
+
+        // Wait for file to appear
+        bool created = wait_for([&]{ return fs::exists(prom_path); }, 5000);
+        ASSERT_TRUE(created, "file should exist");
+
+        // Read the file multiple times quickly — should never see a partial/empty file
+        // (the .tmp file is renamed atomically)
+        bool saw_partial = false;
+        for (int i = 0; i < 50; ++i) {
+            auto content = read_file(prom_path);
+            if (content.empty()) {
+                saw_partial = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+
+        exporter.stop();
+        ASSERT_TRUE(!saw_partial, "should never see empty/partial .prom file");
+
+        // Verify .tmp file does not persist
+        auto tmp_path = prom_path;
+        tmp_path += ".tmp";
+        ASSERT_TRUE(!fs::exists(tmp_path), ".tmp file should not persist");
+        PASS();
+    }
+
+    {
+        TEST(constant_labels_present);
+        fs::remove(prom_path);
+        std::map<std::string, std::string> labels = {
+            {"depot", "/mnt/depot"},
+            {"mode", "readonly"},
+        };
+        MetricsExporter exporter(prom_path, std::chrono::seconds(60), labels);
+        exporter.stop();
+
+        auto content = read_file(prom_path);
+        ASSERT_TRUE(content.find("depot=\"/mnt/depot\"") != std::string::npos,
+                     "should contain depot label");
+        ASSERT_TRUE(content.find("mode=\"readonly\"") != std::string::npos,
+                     "should contain mode label");
+        PASS();
+    }
+
+    fs::remove_all(tmpdir);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1140,6 +1291,7 @@ int main() {
     test_config_defaults_and_validation();
     test_depot_cache_integration();
     test_azure_key_sanitization();
+    test_metrics();
 
     std::cout << "\n===================" << std::endl;
     std::cout << "Results: " << tests_passed << " passed, "

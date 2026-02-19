@@ -215,6 +215,14 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
             auto* v = next_arg(i, "--stats-interval");
             if (!v) return std::nullopt;
             config.stats_interval_secs = std::stoull(v);
+        } else if (arg == "--metrics-file") {
+            auto* v = next_arg(i, "--metrics-file");
+            if (!v) return std::nullopt;
+            config.metrics_file = v;
+        } else if (arg == "--metrics-interval") {
+            auto* v = next_arg(i, "--metrics-interval");
+            if (!v) return std::nullopt;
+            config.metrics_interval_secs = std::stoull(v);
         } else if (arg == "--help" || arg == "-h") {
             std::cerr <<
                 "Usage: p4-cache --depot-path <path> --primary-type <s3|azure|gcs|nfs> [options]\n"
@@ -260,6 +268,8 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
                 "  --log-file <path>                Log file path\n"
                 "  --skip-startup-scan              Skip scanning for untracked files on startup\n"
                 "  --stats-interval <secs>          Stats reporting interval (default: 60)\n"
+                "  --metrics-file <path>            Prometheus .prom file for node_exporter textfile collector\n"
+                "  --metrics-interval <secs>        Metrics write interval (default: 15)\n"
                 "  --help                           Show this help\n";
             return std::nullopt;
         } else {
@@ -307,6 +317,8 @@ bool CacheConfig::load_json(const std::filesystem::path& path) {
         if (j.contains("verbose")) verbose = j["verbose"].get<bool>();
         if (j.contains("skip_startup_scan")) skip_startup_scan = j["skip_startup_scan"].get<bool>();
         if (j.contains("stats_interval")) stats_interval_secs = j["stats_interval"].get<size_t>();
+        if (j.contains("metrics_file")) metrics_file = j["metrics_file"].get<std::string>();
+        if (j.contains("metrics_interval")) metrics_interval_secs = j["metrics_interval"].get<size_t>();
 
         // Parse primary backend
         if (j.contains("primary") && j["primary"].is_object()) {

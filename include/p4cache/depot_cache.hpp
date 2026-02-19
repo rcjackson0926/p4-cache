@@ -22,6 +22,8 @@ class ThreadPool;
 
 namespace p4cache {
 
+class MetricsExporter;
+
 /// Core depot cache engine.
 ///
 /// Manages the LMDB manifest, upload workers (read-write mode only),
@@ -91,6 +93,18 @@ public:
     Stats get_stats() const;
 
     bool is_read_only() const { return config_.read_only; }
+
+    /// Set the metrics exporter (optional; null-checked at call sites).
+    void set_metrics(MetricsExporter* m) { metrics_ = m; }
+
+    /// Accessors for gauge snapshots (read atomic counters).
+    uint64_t count_dirty() const { return count_dirty_.load(); }
+    uint64_t count_uploading() const { return count_uploading_.load(); }
+    uint64_t count_clean() const { return count_clean_.load(); }
+    uint64_t current_cache_bytes() const { return cache_bytes_.load(); }
+    uint64_t max_cache_bytes() const { return config_.max_cache_bytes; }
+    size_t upload_pending() const;
+    size_t restore_pending() const;
 
 private:
     // LMDB manifest operations
@@ -185,6 +199,9 @@ private:
     // Stats
     mutable std::mutex stats_mutex_;
     Stats stats_;
+
+    // Prometheus metrics (optional, null if not configured)
+    MetricsExporter* metrics_ = nullptr;
 };
 
 /// Sanitize a relative depot path into a valid Azure Blob Storage key.

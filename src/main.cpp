@@ -1,6 +1,7 @@
 #include "p4cache/depot_watcher.hpp"
 #include "p4cache/depot_cache.hpp"
 #include "p4cache/cache_config.hpp"
+#include "p4cache/metrics.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -147,6 +148,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Create metrics exporter if configured
+    std::unique_ptr<p4cache::MetricsExporter> metrics;
+    if (!config.metrics_file.empty()) {
+        std::map<std::string, std::string> labels = {
+            {"depot", config.depot_path.string()},
+            {"mode", config.read_only ? "readonly" : "readwrite"},
+        };
+        metrics = std::make_unique<p4cache::MetricsExporter>(
+            config.metrics_file,
+            std::chrono::seconds(config.metrics_interval_secs),
+            labels);
+        cache.set_metrics(metrics.get());
+        metrics->set_cache(&cache);
+    }
+
     // Create and start the depot watcher
     p4cache::DepotWatcher watcher(config.depot_path, config.read_only);
 
@@ -166,8 +182,15 @@ int main(int argc, char* argv[]) {
         watcher.start();
     } catch (const std::exception& e) {
         std::cerr << "Failed to start depot watcher: " << e.what() << std::endl;
+        if (metrics) metrics->stop();
         cache.stop();
         return 1;
+    }
+
+    if (metrics) {
+        metrics->set_watcher(&watcher);
+        metrics->start();
+        std::cout << "  metrics-file: " << config.metrics_file << std::endl;
     }
 
     std::cout << "p4-cache running (PID " << getpid() << ")" << std::endl;
@@ -176,6 +199,7 @@ int main(int argc, char* argv[]) {
     while (!g_shutdown_requested) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    if (metrics) metrics->stop();
     cache.stop();
     cache.wait();
 

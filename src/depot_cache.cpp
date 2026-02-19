@@ -1,4 +1,5 @@
 #include "p4cache/depot_cache.hpp"
+#include "p4cache/metrics.hpp"
 #include "meridian/storage/backend.hpp"
 #include "meridian/core/thread_pool.hpp"
 
@@ -935,6 +936,13 @@ void DepotCache::upload_worker_loop() {
                         stats_.uploads_failed++;
                     }
                 }
+                if (metrics_) {
+                    if (results[i]) {
+                        metrics_->uploads_success().Increment();
+                    } else {
+                        metrics_->uploads_failure().Increment();
+                    }
+                }
             }
 
             rc = mdb_txn_commit(txn);
@@ -951,6 +959,9 @@ void DepotCache::upload_worker_loop() {
 }
 
 bool DepotCache::upload_file(const std::string& rel_path, const std::string& storage_key) {
+    std::optional<ScopedTimer> timer;
+    if (metrics_) timer.emplace(metrics_->upload_duration());
+
     auto full_path = config_.depot_path / rel_path;
 
     // Read file content
@@ -967,6 +978,7 @@ bool DepotCache::upload_file(const std::string& rel_path, const std::string& sto
     // Upload to primary backend
     auto put_result = primary_->put(storage_key, std::span<const uint8_t>(data), {});
     if (put_result.success) {
+        if (metrics_) metrics_->upload_bytes_total().Increment(static_cast<double>(data.size()));
         if (config_.verbose) {
             log_info("Uploaded: %s (%zu bytes)", rel_path.c_str(), data.size());
         }
@@ -1002,6 +1014,9 @@ void DepotCache::eviction_worker_loop() {
                  cache_bytes_.load(), config_.eviction_target);
 
         while (running_.load() && cache_bytes_.load() > config_.eviction_target) {
+            std::optional<ScopedTimer> batch_timer;
+            if (metrics_) batch_timer.emplace(metrics_->eviction_batch_duration());
+
             // Phase 0: Fetch candidates (oldest clean files) — read-only, no mutex
             struct EvictCandidate {
                 std::string path;
@@ -1103,6 +1118,10 @@ void DepotCache::eviction_worker_loop() {
                         std::lock_guard lock(stats_mutex_);
                         stats_.evictions_performed++;
                     }
+                    if (metrics_) {
+                        metrics_->evictions_total().Increment();
+                        metrics_->eviction_bytes_total().Increment(static_cast<double>(entry.size));
+                    }
 
                     if (config_.verbose) {
                         log_info("Evicted: %s (%lu bytes)", ef.path.c_str(), entry.size);
@@ -1141,8 +1160,12 @@ bool DepotCache::restore_file(const std::string& rel_path, const std::string& st
             std::string path_copy = rel_path;
             std::string key_copy = storage_key;
             restore_pool_->execute([this, path_copy, key_copy, promise]() {
+                std::optional<ScopedTimer> timer;
+                if (metrics_) timer.emplace(metrics_->restore_duration());
+
                 bool ok = false;
                 bool from_secondary = false;
+                uint64_t restore_size = 0;
                 try {
                     auto get_result = primary_->get(key_copy, {});
                     if (!get_result.success && secondary_) {
@@ -1195,6 +1218,7 @@ bool DepotCache::restore_file(const std::string& rel_path, const std::string& st
 
                             cache_bytes_ += get_result.data.size();
                             count_clean_++;
+                            restore_size = get_result.data.size();
                         }
                     }
                 } catch (const std::exception& e) {
@@ -1208,6 +1232,15 @@ bool DepotCache::restore_file(const std::string& rel_path, const std::string& st
                         if (from_secondary) stats_.secondary_restores++;
                     } else {
                         stats_.restores_failed++;
+                    }
+                }
+                if (metrics_) {
+                    if (ok) {
+                        metrics_->restores_success().Increment();
+                        metrics_->restore_bytes_total().Increment(static_cast<double>(restore_size));
+                        if (from_secondary) metrics_->restores_secondary_total().Increment();
+                    } else {
+                        metrics_->restores_failure().Increment();
                     }
                 }
 
@@ -1229,6 +1262,9 @@ bool DepotCache::restore_file(const std::string& rel_path, const std::string& st
 // --- Shim server ---
 
 std::string DepotCache::fetch_for_shim(const std::string& relative_path) {
+    std::optional<ScopedTimer> timer;
+    if (metrics_) timer.emplace(metrics_->shim_request_duration());
+
     // Check if file already exists on NVMe (race: another thread may have created it)
     auto full_path = config_.depot_path / relative_path;
     {
@@ -1269,6 +1305,7 @@ std::string DepotCache::fetch_for_shim(const std::string& relative_path) {
     if (!get_result.success) {
         std::lock_guard lock(stats_mutex_);
         stats_.shim_not_found++;
+        if (metrics_) metrics_->shim_not_found().Increment();
         return "NOTFOUND";
     }
 
@@ -1337,6 +1374,7 @@ std::string DepotCache::fetch_for_shim(const std::string& relative_path) {
     {
         std::lock_guard lock(stats_mutex_);
         stats_.shim_fetches++;
+        if (metrics_) metrics_->shim_fetched().Increment();
     }
 
     maybe_trigger_eviction();
@@ -1429,6 +1467,14 @@ void DepotCache::shim_server_loop() {
 DepotCache::Stats DepotCache::get_stats() const {
     std::lock_guard lock(stats_mutex_);
     return stats_;
+}
+
+size_t DepotCache::upload_pending() const {
+    return upload_pool_ ? upload_pool_->pending() : 0;
+}
+
+size_t DepotCache::restore_pending() const {
+    return restore_pool_ ? restore_pool_->pending() : 0;
 }
 
 void DepotCache::stats_reporter_loop() {

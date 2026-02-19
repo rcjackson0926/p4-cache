@@ -65,6 +65,10 @@ struct CacheConfig {
     std::filesystem::path pid_file;
     std::filesystem::path log_file;
 
+    // Prometheus metrics (textfile collector)
+    std::filesystem::path metrics_file;    // e.g. /var/lib/node_exporter/textfile/p4cache.prom
+    size_t metrics_interval_secs = 15;
+
     /// Parse configuration from command line arguments.
     /// Returns empty optional on error (prints usage to stderr).
     static std::optional<CacheConfig> from_args(int argc, char* argv[]);
