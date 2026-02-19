@@ -1393,6 +1393,30 @@ private:
         total_bytes_.fetch_sub(size, std::memory_order_relaxed);
     }
 
+    /// Percent-encode each path segment while preserving '/' separators.
+    /// Required for S3 keys containing characters like commas (Perforce
+    /// stores revisions as file,d/1.2.gz).
+    static std::string url_encode_path(const std::string& path) {
+        std::string result;
+        size_t start = 0;
+        while (start < path.size()) {
+            auto slash = path.find('/', start);
+            std::string segment;
+            if (slash != std::string::npos) {
+                segment = path.substr(start, slash - start);
+                start = slash + 1;
+            } else {
+                segment = path.substr(start);
+                start = path.size();
+            }
+            if (!result.empty()) {
+                result += '/';
+            }
+            result += net::url_encode(segment);
+        }
+        return result;
+    }
+
     std::string build_url(const std::string& key) const {
         std::string url;
         if (!config_.endpoint.empty()) {
@@ -1409,9 +1433,11 @@ private:
         }
         if (!key.empty()) {
             if (!config_.path_prefix.empty()) {
-                url += "/" + config_.path_prefix + key;
+                std::string prefix = config_.path_prefix;
+                if (prefix.back() != '/') prefix += '/';
+                url += "/" + url_encode_path(prefix + key);
             } else {
-                url += "/" + key;
+                url += "/" + url_encode_path(key);
             }
         }
         return url;
@@ -2264,7 +2290,9 @@ private:
         }
         if (!key.empty()) {
             if (!config_.path_prefix.empty()) {
-                url += "/" + url_encode_path(config_.path_prefix + key);
+                std::string prefix = config_.path_prefix;
+                if (prefix.back() != '/') prefix += '/';
+                url += "/" + url_encode_path(prefix + key);
             } else {
                 url += "/" + url_encode_path(key);
             }
@@ -2348,7 +2376,9 @@ private:
         string_to_sign += "/" + config_.account_name + "/" + config_.container;
         if (!key.empty()) {
             if (!config_.path_prefix.empty()) {
-                string_to_sign += "/" + config_.path_prefix + key;
+                std::string prefix = config_.path_prefix;
+                if (prefix.back() != '/') prefix += '/';
+                string_to_sign += "/" + prefix + key;
             } else {
                 string_to_sign += "/" + key;
             }
@@ -3025,7 +3055,9 @@ private:
 
     std::string make_key(const std::string& key) const {
         if (!config_.path_prefix.empty()) {
-            return config_.path_prefix + key;
+            std::string prefix = config_.path_prefix;
+            if (prefix.back() != '/') prefix += '/';
+            return prefix + key;
         }
         return key;
     }
@@ -4133,6 +4165,11 @@ std::unique_ptr<StorageBackend> StorageBackendFactory::create(
         }
         if ((it = config.find("use_path_style")) != config.end()) {
             s3_config.use_path_style = (it->second == "true" || it->second == "1");
+        }
+        // Auto-enable path-style for custom endpoints (MinIO, Ceph, etc.)
+        // unless explicitly set by config
+        if (config.find("use_path_style") == config.end() && !s3_config.endpoint.empty()) {
+            s3_config.use_path_style = true;
         }
         if ((it = config.find("verify_ssl")) != config.end()) {
             s3_config.verify_ssl = (it->second == "true" || it->second == "1");

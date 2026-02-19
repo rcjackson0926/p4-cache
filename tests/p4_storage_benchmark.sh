@@ -133,6 +133,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 P4CACHE_BIN=${P4CACHE_BIN:-${REPO_ROOT}/build/p4-cache}
 P4SHIM_LIB=${P4SHIM_LIB:-${REPO_ROOT}/build/libp4shim.so}
 P4CACHE_PID=""
+S3_DEPOT_ROOT=""  # separate directory for S3 depot data (set before p4d starts)
 
 mkdir -p "$TESTDIR"
 RESULTS_FILE=$TESTDIR/results.csv
@@ -299,6 +300,12 @@ clean_test_artifacts() {
         fi
     done
 
+    # Remove S3 depot data directory
+    if [ -d "$TESTDIR/s3-depot" ]; then
+        rm -rf "$TESTDIR/s3-depot"
+        echo "  Removed S3 depot data: $TESTDIR/s3-depot"
+    fi
+
     # Remove S3 depot objects
     for backend in "${BACKEND_LIST[@]}"; do
         if [ "$backend" = "s3" ]; then
@@ -347,9 +354,8 @@ cleanup() {
             cp "$P4ROOT/p4d.log" "$TESTDIR/p4d.log"
             echo "  Saved p4d log to $TESTDIR/p4d.log"
         fi
-        if [ -f "$P4ROOT/p4cache.log" ]; then
-            cp "$P4ROOT/p4cache.log" "$TESTDIR/p4cache.log"
-            echo "  Saved p4-cache log to $TESTDIR/p4cache.log"
+        if [ -f "$TESTDIR/p4cache.log" ]; then
+            echo "  p4-cache log at $TESTDIR/p4cache.log"
         fi
         rm -rf "$P4ROOT"
         echo "  Removed p4d root: $P4ROOT"
@@ -527,8 +533,13 @@ start_p4d() {
     done
 
     if $has_s3; then
+        # Create a separate directory for S3 depot data so p4-cache only
+        # watches depot files, not p4d's internal db.* metadata files.
+        S3_DEPOT_ROOT="$TESTDIR/s3-depot"
+        mkdir -p "$S3_DEPOT_ROOT"
+
         echo "Starting p4d with LD_PRELOAD shim (root: $P4ROOT, port: $P4PORT) ..."
-        LD_PRELOAD="$P4SHIM_LIB" P4CACHE_DEPOT="$P4ROOT" \
+        LD_PRELOAD="$P4SHIM_LIB" P4CACHE_DEPOT="$S3_DEPOT_ROOT" \
             "$P4D_BIN" -r "$P4ROOT" -p "$P4PORT" -L "$P4ROOT/p4d.log" &
     else
         echo "Starting p4d (root: $P4ROOT, port: $P4PORT) ..."
@@ -562,7 +573,7 @@ start_p4cache() {
     $has_s3 || return 0
 
     echo ""
-    echo "Starting p4-cache daemon (depot: $P4ROOT, S3: $S3_ENDPOINT/$S3_BUCKET) ..."
+    echo "Starting p4-cache daemon (depot: $S3_DEPOT_ROOT, S3: $S3_ENDPOINT/$S3_BUCKET) ..."
 
     # Grant fanotify capability if not already set
     if ! getcap "$P4CACHE_BIN" 2>/dev/null | grep -q cap_sys_admin; then
@@ -574,7 +585,7 @@ start_p4cache() {
     fi
 
     "$P4CACHE_BIN" \
-        --depot-path "$P4ROOT" \
+        --depot-path "$S3_DEPOT_ROOT" \
         --primary-type s3 \
         --primary-endpoint "$S3_ENDPOINT" \
         --primary-bucket "$S3_BUCKET" \
@@ -582,16 +593,16 @@ start_p4cache() {
         --primary-access-key "$S3_ACCESS_KEY" \
         --primary-secret-key "$S3_SECRET_KEY" \
         --primary-no-verify-ssl \
-        --primary-prefix "$(depot_for s3)" \
         --max-cache-gb 100 \
         --upload-threads 8 \
         --restore-threads 16 \
+        --stats-interval 5 \
         --verbose \
         --daemon \
-        --pid-file "$P4ROOT/.p4cache.pid" \
-        --log-file "$P4ROOT/p4cache.log"
+        --pid-file "$TESTDIR/p4cache.pid" \
+        --log-file "$TESTDIR/p4cache.log"
 
-    P4CACHE_PID=$(cat "$P4ROOT/.p4cache.pid" 2>/dev/null)
+    P4CACHE_PID=$(cat "$TESTDIR/p4cache.pid" 2>/dev/null)
     echo "p4-cache ready (PID $P4CACHE_PID)."
 }
 
@@ -631,7 +642,9 @@ setup_p4() {
             s3)
                 # S3 depot: local depot backed by p4-cache daemon.
                 # p4d writes to local disk; p4-cache uploads to S3 in the background.
-                depot_map="${depot}/..."
+                # Uses an absolute path map (separate from P4ROOT) so p4-cache only
+                # watches depot files, not p4d's internal db.* metadata.
+                depot_map="${S3_DEPOT_ROOT}/${depot}/..."
                 ;;
         esac
 
@@ -868,6 +881,52 @@ cp -r "$DATADIR/xlarge"/* "$COMBINED/"
 
 run_category "mixed" "$COMBINED" "mixed" "Mixed workload (175 files, ~76MB)"
 
+# -- Wait for p4-cache to finish uploading to S3 -------------------
+if [ -n "$P4CACHE_PID" ] && [ -n "$S3_DEPOT_ROOT" ]; then
+    echo "--- p4-cache S3 upload drain ---"
+    echo "  Waiting for p4-cache to finish uploading all files to S3 ..."
+    upload_start=$(date +%s%N)
+
+    # Poll the stats log for "0 dirty, 0 uploading".
+    # p4-cache logs stats every --stats-interval seconds (set to 5 above).
+    while true; do
+        # Read the most recent stats line
+        latest_stats=$(grep '\[stats\]' "$TESTDIR/p4cache.log" 2>/dev/null | tail -1 || true)
+        if [ -z "$latest_stats" ]; then
+            sleep 5
+            continue
+        fi
+
+        dirty=$(echo "$latest_stats" | grep -oP '\K[0-9]+(?= dirty)' || echo "?")
+        uploading=$(echo "$latest_stats" | grep -oP '\K[0-9]+(?= uploading)' || echo "?")
+        uploads_ok=$(echo "$latest_stats" | grep -oP 'uploads: \K[0-9]+(?= ok)' || echo "?")
+        uploads_fail=$(echo "$latest_stats" | grep -oP 'uploads: [0-9]+ ok, \K[0-9]+(?= fail)' || echo "?")
+
+        printf "\r  dirty=%s  uploading=%s  completed=%s  failed=%s" \
+            "$dirty" "$uploading" "$uploads_ok" "$uploads_fail"
+
+        if [ "$dirty" = "0" ] && [ "$uploading" = "0" ]; then
+            break
+        fi
+
+        sleep 5
+    done
+
+    upload_end=$(date +%s%N)
+    upload_elapsed=$(echo "scale=3; ($upload_end - $upload_start) / 1000000000" | bc)
+    echo ""
+
+    # Calculate total bytes uploaded from depot data
+    s3_depot_bytes=$(du -sb "$S3_DEPOT_ROOT" 2>/dev/null | cut -f1 || echo 0)
+    s3_depot_bytes=${s3_depot_bytes:-0}
+
+    printf "  p4-cache S3 upload complete: %.3fs (%s uploaded, %s ok, %s failed)\n" \
+        "$upload_elapsed" "$(numfmt --to=iec "$s3_depot_bytes")" "$uploads_ok" "$uploads_fail"
+
+    echo "p4cache-drain,s3,upload-drain,0,$s3_depot_bytes,$upload_elapsed" >> "$RESULTS_FILE"
+    echo ""
+fi
+
 # -- Summary -------------------------------------------------------
 echo "================================================="
 echo "Benchmark complete.  Results in $RESULTS_FILE"
@@ -876,7 +935,9 @@ echo "================================================="
 # Check logs for S3 errors
 echo ""
 S3_ERRORS=0
-for logfile in "$P4ROOT/p4d.log" "$P4ROOT/p4cache.log"; do
+P4CACHE_LOG="$TESTDIR/p4cache.log"
+for logfile in "$P4ROOT/p4d.log" "$P4CACHE_LOG"; do
+    [ -z "$logfile" ] && continue
     if [ -f "$logfile" ]; then
         local_errors=$(grep -ci "s3.*fail\|s3.*error\|ssl.*error\|certificate\|upload.*fail" "$logfile" 2>/dev/null || true)
         S3_ERRORS=$((S3_ERRORS + ${local_errors:-0}))
@@ -886,7 +947,7 @@ if [ "$S3_ERRORS" -gt 0 ] 2>/dev/null; then
     echo "WARNING: $S3_ERRORS S3/SSL errors detected in logs."
     echo "  First few errors:"
     grep -i "s3.*fail\|s3.*error\|ssl.*error\|certificate\|upload.*fail" \
-        "$P4ROOT/p4d.log" "$P4ROOT/p4cache.log" 2>/dev/null | head -5 | sed 's/^/    /'
+        "$P4ROOT/p4d.log" "$P4CACHE_LOG" 2>/dev/null | head -5 | sed 's/^/    /'
     echo "  Logs saved to $TESTDIR/p4d.log and $TESTDIR/p4cache.log"
 else
     echo "No S3 errors detected."
