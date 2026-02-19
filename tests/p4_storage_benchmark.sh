@@ -626,6 +626,8 @@ start_p4cache() {
         --upload-threads 8 \
         --restore-threads 16 \
         --stats-interval 5 \
+        --metrics-file "$TESTDIR/p4cache.prom" \
+        --metrics-interval 5 \
         --verbose \
         --daemon \
         --pid-file "$TESTDIR/p4cache.pid" \
@@ -954,6 +956,108 @@ if [ -n "$P4CACHE_PID" ] && [ -n "$S3_DEPOT_ROOT" ]; then
 
     echo "p4cache-drain,s3,upload-drain,0,$s3_depot_bytes,$upload_elapsed" >> "$RESULTS_FILE"
     echo ""
+
+    # -- Prometheus metrics summary ------------------------------------
+    PROM_FILE="$TESTDIR/p4cache.prom"
+    if [ -f "$PROM_FILE" ]; then
+        echo "--- p4-cache Prometheus Metrics ---"
+        echo ""
+
+        # Helper: extract a single metric value by name (ignoring comments/TYPE/HELP lines)
+        prom_val() {
+            local name="$1" labels="${2:-}"
+            if [ -n "$labels" ]; then
+                grep "^${name}{.*${labels}" "$PROM_FILE" 2>/dev/null | head -1 | awk '{print $NF}'
+            else
+                grep "^${name} " "$PROM_FILE" 2>/dev/null | head -1 | awk '{print $NF}'
+            fi
+        }
+
+        # Helper: format a number with optional unit
+        fmt_num() {
+            local val="${1:-0}"
+            # Strip trailing .0 for display
+            echo "$val" | sed 's/\.0$//'
+        }
+
+        # Counters
+        uploads_ok=$(fmt_num "$(prom_val p4cache_uploads_total 'result="success"')")
+        uploads_fail=$(fmt_num "$(prom_val p4cache_uploads_total 'result="failure"')")
+        upload_bytes=$(prom_val p4cache_upload_bytes_total)
+        restores_ok=$(fmt_num "$(prom_val p4cache_restores_total 'result="success"')")
+        restores_fail=$(fmt_num "$(prom_val p4cache_restores_total 'result="failure"')")
+        restore_bytes=$(prom_val p4cache_restore_bytes_total)
+        restores_secondary=$(fmt_num "$(prom_val p4cache_restores_secondary_total)")
+        evictions=$(fmt_num "$(prom_val p4cache_evictions_total)")
+        eviction_bytes=$(prom_val p4cache_eviction_bytes_total)
+        shim_fetched=$(fmt_num "$(prom_val p4cache_shim_requests_total 'result="fetched"')")
+        shim_not_found=$(fmt_num "$(prom_val p4cache_shim_requests_total 'result="not_found"')")
+
+        # Gauges
+        files_dirty=$(fmt_num "$(prom_val p4cache_files_dirty)")
+        files_uploading=$(fmt_num "$(prom_val p4cache_files_uploading)")
+        files_clean=$(fmt_num "$(prom_val p4cache_files_clean)")
+        files_total=$(fmt_num "$(prom_val p4cache_files_total)")
+        cache_bytes=$(prom_val p4cache_cache_bytes)
+        cache_max=$(prom_val p4cache_cache_max_bytes)
+
+        # Histogram summaries (sum / count = avg)
+        upload_dur_sum=$(prom_val p4cache_upload_duration_seconds_sum)
+        upload_dur_count=$(prom_val p4cache_upload_duration_seconds_count)
+        restore_dur_sum=$(prom_val p4cache_restore_duration_seconds_sum)
+        restore_dur_count=$(prom_val p4cache_restore_duration_seconds_count)
+        shim_dur_sum=$(prom_val p4cache_shim_request_duration_seconds_sum)
+        shim_dur_count=$(prom_val p4cache_shim_request_duration_seconds_count)
+
+        echo "  Counters:"
+        printf "    Uploads:    %s ok, %s failed" "${uploads_ok:-0}" "${uploads_fail:-0}"
+        [ -n "$upload_bytes" ] && [ "$upload_bytes" != "0" ] && \
+            printf "  (%s)" "$(numfmt --to=iec "${upload_bytes%.*}" 2>/dev/null || echo "${upload_bytes} B")"
+        echo ""
+        printf "    Restores:   %s ok, %s failed" "${restores_ok:-0}" "${restores_fail:-0}"
+        [ -n "$restore_bytes" ] && [ "$restore_bytes" != "0" ] && \
+            printf "  (%s)" "$(numfmt --to=iec "${restore_bytes%.*}" 2>/dev/null || echo "${restore_bytes} B")"
+        [ -n "$restores_secondary" ] && [ "$restores_secondary" != "0" ] && \
+            printf "  [%s from secondary]" "$restores_secondary"
+        echo ""
+        printf "    Evictions:  %s" "${evictions:-0}"
+        [ -n "$eviction_bytes" ] && [ "$eviction_bytes" != "0" ] && \
+            printf "  (%s)" "$(numfmt --to=iec "${eviction_bytes%.*}" 2>/dev/null || echo "${eviction_bytes} B")"
+        echo ""
+        printf "    Shim reqs:  %s fetched, %s not_found\n" "${shim_fetched:-0}" "${shim_not_found:-0}"
+        echo ""
+
+        echo "  Gauges:"
+        printf "    Files:      %s total  (dirty=%s, uploading=%s, clean=%s)\n" \
+            "${files_total:-0}" "${files_dirty:-0}" "${files_uploading:-0}" "${files_clean:-0}"
+        printf "    Cache:      %s / %s\n" \
+            "$(numfmt --to=iec "${cache_bytes%.*}" 2>/dev/null || echo "${cache_bytes:-0} B")" \
+            "$(numfmt --to=iec "${cache_max%.*}" 2>/dev/null || echo "${cache_max:-0} B")"
+        echo ""
+
+        echo "  Latency (avg):"
+        if [ -n "$upload_dur_count" ] && [ "$upload_dur_count" != "0" ] && [ "$upload_dur_count" != "0.0" ]; then
+            avg_upload=$(echo "scale=3; $upload_dur_sum / $upload_dur_count" | bc 2>/dev/null || echo "?")
+            printf "    Upload:     %ss  (%s ops, total %ss)\n" "$avg_upload" "$upload_dur_count" "$upload_dur_sum"
+        else
+            echo "    Upload:     (no data)"
+        fi
+        if [ -n "$restore_dur_count" ] && [ "$restore_dur_count" != "0" ] && [ "$restore_dur_count" != "0.0" ]; then
+            avg_restore=$(echo "scale=3; $restore_dur_sum / $restore_dur_count" | bc 2>/dev/null || echo "?")
+            printf "    Restore:    %ss  (%s ops, total %ss)\n" "$avg_restore" "$restore_dur_count" "$restore_dur_sum"
+        else
+            echo "    Restore:    (no data)"
+        fi
+        if [ -n "$shim_dur_count" ] && [ "$shim_dur_count" != "0" ] && [ "$shim_dur_count" != "0.0" ]; then
+            avg_shim=$(echo "scale=3; $shim_dur_sum / $shim_dur_count" | bc 2>/dev/null || echo "?")
+            printf "    Shim req:   %ss  (%s ops, total %ss)\n" "$avg_shim" "$shim_dur_count" "$shim_dur_sum"
+        else
+            echo "    Shim req:   (no data)"
+        fi
+        echo ""
+        echo "  Raw .prom file: $PROM_FILE"
+        echo ""
+    fi
 fi
 
 # -- Summary -------------------------------------------------------
