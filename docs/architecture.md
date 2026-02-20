@@ -63,7 +63,9 @@ Key classes:
 
 Standalone `p4-cache-access` binary for querying the access log database. Opens the LMDB access log read-only. Only links against LMDB (no meridian, no curl, no prometheus).
 
-Subcommands: `stat`, `count`, `get <path>`, `prefix <prefix>`, `stale --before <time>`, `export`.
+Subcommands: `stat`, `count`, `get <path>`, `prefix <prefix>`, `stale --before <time>`, `export [--format csv|tsv]`.
+
+Options: `--db <path>` (LMDB directory), `--before <time>` (epoch or duration like `30d`), `--limit <N>` (cap output), `--output <file>` (write to file with 1MB buffer), `--format csv|tsv` (default: tsv).
 
 ### 7. main.cpp
 
@@ -276,12 +278,15 @@ Access log failure never affects cache correctness (uploads, evictions, restores
 The `p4-cache-access` binary opens the access LMDB read-only for analysis:
 
 ```bash
-p4-cache-access --db .p4cache/access stat       # Entry count, tree depth, DB size
-p4-cache-access --db .p4cache/access get <path>  # Last access time for one file
-p4-cache-access --db .p4cache/access prefix dir/ # Files under a directory
-p4-cache-access --db .p4cache/access stale --before 30d  # Files not accessed in 30 days
-p4-cache-access --db .p4cache/access export --format csv  # Full dump
+p4-cache-access --db .p4cache/access stat                  # Entry count, tree depth, DB size
+p4-cache-access --db .p4cache/access count                 # Total entries (fast)
+p4-cache-access --db .p4cache/access get <path>            # Last access time for one file
+p4-cache-access --db .p4cache/access prefix dir/           # Files under a directory prefix
+p4-cache-access --db .p4cache/access stale --before 30d    # Files not accessed in 30 days
+p4-cache-access --db .p4cache/access export --format csv   # Full dump (default format: tsv)
 ```
+
+Options `--limit <N>` and `--output <file>` work with `prefix`, `stale`, and `export`.
 
 ## Storage Backend Integration
 

@@ -183,6 +183,8 @@ Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaul
 | `metrics_interval` | integer | Metrics write interval in seconds (default 15) |
 | `access_log_enabled` | bool | Enable access log tracking (default true) |
 | `access_batch_size` | integer | Entries before batch flush (default 10000) |
+| `access_flush_interval_secs` | integer | Seconds between periodic batch flushes (default 5) |
+| `access_sync_interval_secs` | integer | Seconds between `mdb_env_sync()` calls (default 60) |
 | `access_mapsize_gb` | integer | LMDB map size for access DB in GB (default 512) |
 
 ### Backend Object Fields

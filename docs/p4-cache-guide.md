@@ -203,20 +203,23 @@ The daemon permanently tracks when each depot file was last read through the cac
 # Entry count and DB stats
 p4-cache-access --db /mnt/nvme/depot/.p4cache/access stat
 
+# Total entry count (fast, uses mdb_stat)
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access count
+
 # Look up when a specific file was last accessed
 p4-cache-access --db /mnt/nvme/depot/.p4cache/access get depot/main/src/foo.cpp
 
 # List files under a directory prefix
 p4-cache-access --db /mnt/nvme/depot/.p4cache/access prefix depot/main/src/
 
-# Find files not accessed in 30 days
-p4-cache-access --db /mnt/nvme/depot/.p4cache/access stale --before 30d
+# Find files not accessed in 30 days (limit output to 1000 entries)
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access stale --before 30d --limit 1000
 
-# Export entire access database
+# Export entire access database to a file (default format: tsv)
 p4-cache-access --db /mnt/nvme/depot/.p4cache/access export --format csv --output access.csv
 ```
 
-Default `--db` path: `$P4CACHE_DEPOT/.p4cache/access/` or `.p4cache/access/` under CWD.
+Default `--db` path: `$P4CACHE_DEPOT/.p4cache/access/` or `.p4cache/access/` under CWD. The `--before` option accepts epoch seconds or durations like `30d`, `6h`, `90m`.
 
 ### Disabling
 

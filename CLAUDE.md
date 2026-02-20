@@ -13,7 +13,8 @@ Meridian storage/threading code lives in `include/meridian/` (headers) and `src/
 | Binary | Purpose |
 |--------|---------|
 | `p4-cache` | NVMe + multi-backend cache daemon for Perforce depots |
-| `libp4shim.so` | LD_PRELOAD shim for P4d cold file interception (ENOENT path) |
+| `libp4shim.so` | LD_PRELOAD shim for P4d cold file interception (ENOENT path) and access recording |
+| `p4-cache-access` | Standalone query tool for the access log database |
 
 ## P4 Cache (NVMe Depot Acceleration)
 
@@ -43,6 +44,7 @@ p4-cache --depot-path /mnt/nvme/depot --primary-type s3 --primary-bucket ... --r
 - Does NOT use `FAN_OPEN_PERM` — this blocks ALL opens on the entire mount, stalling the filesystem. Read interception is handled entirely by the LD_PRELOAD shim via ENOENT.
 - Evicted files are deleted (not truncated to 0-byte stubs) — avoids inode exhaustion at billion-file scale.
 - LMDB manifest with 3 databases (files, dirty_queue, evict_order) tracks 3 file states (dirty -> uploading -> clean). No "evicted" state.
+- Separate LMDB access log database tracks per-file last-read timestamps. The shim records accesses in a thread-local ring buffer (~7ns overhead) and sends batched datagrams to the daemon.
 - Read-only mode skips fanotify entirely (no `FAN_CLOSE_WRITE` needed).
 - Requires `CAP_SYS_ADMIN` for fanotify: `sudo setcap cap_sys_admin+ep p4-cache`
 
@@ -51,6 +53,7 @@ p4-cache --depot-path /mnt/nvme/depot --primary-type s3 --primary-bucket ... --r
 - Engine: `include/p4cache/depot_cache.hpp`, `src/depot_cache.cpp`
 - Watcher: `include/p4cache/depot_watcher.hpp`, `src/depot_watcher.cpp`
 - Shim: `src/shim.cpp`
+- Access tool: `src/access_tool.cpp`
 - Daemon: `src/main.cpp`
 
 **Documentation:**
