@@ -233,6 +233,10 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
             auto* v = next_arg(i, "--access-mapsize-gb");
             if (!v) return std::nullopt;
             config.access_mapsize_gb = std::stoull(v);
+        } else if (arg == "--access-db-path") {
+            auto* v = next_arg(i, "--access-db-path");
+            if (!v) return std::nullopt;
+            config.access_db_path = v;
         } else if (arg == "--help" || arg == "-h") {
             std::cerr <<
                 "Usage: p4-cache --depot-path <path> --primary-type <s3|azure|gcs|nfs> [options]\n"
@@ -285,6 +289,8 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
                 "  --no-access-log                  Disable access log (default: enabled)\n"
                 "  --access-batch-size <N>          Access log batch size (default: 10000)\n"
                 "  --access-mapsize-gb <N>          Access log LMDB map size in GB (default: 512)\n"
+                "  --access-db-path <path>          Access log LMDB directory (default: <state_dir>/access/)\n"
+                "                                   Use to share one access DB across multiple daemons.\n"
                 "  --help                           Show this help\n";
             return std::nullopt;
         } else {
@@ -337,6 +343,7 @@ bool CacheConfig::load_json(const std::filesystem::path& path) {
         if (j.contains("access_log_enabled")) access_log_enabled = j["access_log_enabled"].get<bool>();
         if (j.contains("access_batch_size")) access_batch_size = j["access_batch_size"].get<size_t>();
         if (j.contains("access_mapsize_gb")) access_mapsize_gb = j["access_mapsize_gb"].get<uint64_t>();
+        if (j.contains("access_db_path")) access_db_path = j["access_db_path"].get<std::string>();
 
         // Parse primary backend
         if (j.contains("primary") && j["primary"].is_object()) {

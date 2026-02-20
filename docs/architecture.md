@@ -273,6 +273,10 @@ Single unnamed database (no `mdb_env_set_maxdbs` call needed):
 
 Access log failure never affects cache correctness (uploads, evictions, restores).
 
+### Multi-Daemon Shared Access DB
+
+LMDB natively supports multiple processes writing to the same database — write transactions are serialized by a shared lock file mutex. To point multiple p4-cache daemons at the same access log (e.g., a primary and replica sharing one NFS-mounted LMDB directory), use `--access-db-path <shared-path>` on each daemon. Each daemon still needs its own `state_dir` for the manifest and sockets.
+
 ### Query Tool
 
 The `p4-cache-access` binary opens the access LMDB read-only for analysis:

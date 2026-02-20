@@ -61,27 +61,151 @@ void format_timestamp(uint64_t ts, char* buf, size_t buf_size) {
     strftime(buf, buf_size, "%Y-%m-%dT%H:%M:%SZ", &tm_val);
 }
 
-void print_usage() {
-    fprintf(stderr,
-        "Usage: p4-cache-access --db <path> <subcommand> [args]\n"
-        "\n"
-        "Subcommands:\n"
-        "  stat                          Entry count, tree depth, DB size\n"
-        "  count                         Total entries (fast)\n"
-        "  get <path>                    Look up last access time for one file\n"
-        "  prefix <prefix>               List files under a directory prefix\n"
-        "  stale --before <time>         Files not accessed since a given time\n"
-        "  export [--format csv|tsv]     Dump entire database\n"
-        "\n"
-        "Options:\n"
-        "  --db <path>                   Path to access LMDB directory\n"
-        "                                (default: $P4CACHE_DEPOT/.p4cache/access/\n"
-        "                                 or .p4cache/access/ under CWD)\n"
-        "  --before <time>               Epoch seconds or duration (30d, 6h, 90m)\n"
-        "  --limit <N>                   Max entries to output\n"
-        "  --output <file>               Write output to file (uses 1MB buffer)\n"
-        "  --help                        Show this help\n"
-    );
+void print_usage(const char* cmd = nullptr) {
+    if (!cmd || strcmp(cmd, "") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access [--db <path>] <command> [options]\n"
+            "\n"
+            "Query the p4-cache access log — a permanent LMDB database that records\n"
+            "when each depot file was last read through the cache.\n"
+            "\n"
+            "Commands:\n"
+            "  stat              Show database statistics (entry count, depth, size)\n"
+            "  count             Print total entry count (single number)\n"
+            "  get <path>        Look up the last access time for one file\n"
+            "  prefix <prefix>   List all files matching a path prefix\n"
+            "  stale             Find files not accessed since a given time\n"
+            "  export            Dump the entire database\n"
+            "\n"
+            "Global options:\n"
+            "  --db <path>       Path to the access LMDB directory\n"
+            "                    Default: $P4CACHE_DEPOT/.p4cache/access/\n"
+            "                             or .p4cache/access/ under CWD\n"
+            "  --help, -h        Show this help (use '<command> --help' for details)\n"
+            "\n"
+            "Examples:\n"
+            "  p4-cache-access stat\n"
+            "  p4-cache-access get depot/main/src/engine.cpp\n"
+            "  p4-cache-access prefix depot/main/src/ --limit 100\n"
+            "  p4-cache-access stale --before 30d --limit 1000\n"
+            "  p4-cache-access export --format csv --output access.csv\n"
+        );
+    } else if (strcmp(cmd, "stat") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access stat\n"
+            "\n"
+            "Display database statistics including entry count, B-tree depth,\n"
+            "page counts, actual disk usage, and configured map size.\n"
+            "\n"
+            "Output fields:\n"
+            "  entries      Total number of file paths tracked\n"
+            "  depth        B-tree depth (typically 3-5 for large databases)\n"
+            "  page_size    LMDB page size in bytes (usually 4096)\n"
+            "  branch_pgs   Number of B-tree branch (internal) pages\n"
+            "  leaf_pgs     Number of B-tree leaf pages\n"
+            "  overflow_pgs Number of overflow pages (for keys > page_size/2)\n"
+            "  db_size      Actual disk usage in bytes and MB\n"
+            "  map_size     Configured virtual address space in bytes and GB\n"
+            "\n"
+            "Example:\n"
+            "  p4-cache-access --db /mnt/nvme/depot/.p4cache/access stat\n"
+        );
+    } else if (strcmp(cmd, "count") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access count\n"
+            "\n"
+            "Print the total number of entries in the access database.\n"
+            "Outputs a single number, suitable for scripting.\n"
+            "\n"
+            "Example:\n"
+            "  entries=$(p4-cache-access count)\n"
+            "  echo \"Tracking $entries files\"\n"
+        );
+    } else if (strcmp(cmd, "get") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access get <path>\n"
+            "\n"
+            "Look up the last access time for a single file. The <path> must\n"
+            "be the depot-relative path (same format the daemon stores).\n"
+            "\n"
+            "Output: <epoch_seconds>\\t<ISO-8601 timestamp>\n"
+            "        or \"NOTFOUND\" if the file has no access record.\n"
+            "\n"
+            "Example:\n"
+            "  p4-cache-access get depot/main/src/engine.cpp\n"
+            "  # Output: 1708387200\t2024-02-20T00:00:00Z\n"
+        );
+    } else if (strcmp(cmd, "prefix") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access prefix <prefix> [--limit <N>] [--output <file>]\n"
+            "                                       [--format csv|tsv]\n"
+            "\n"
+            "List all files whose path starts with <prefix>. Uses an LMDB range\n"
+            "cursor (MDB_SET_RANGE) for efficient prefix scanning — does not\n"
+            "scan the entire database.\n"
+            "\n"
+            "Output columns: path, epoch_seconds, ISO-8601 timestamp\n"
+            "\n"
+            "Options:\n"
+            "  --limit <N>       Stop after N matching entries\n"
+            "  --format csv|tsv  Output format (default: tsv)\n"
+            "  --output <file>   Write to file instead of stdout\n"
+            "\n"
+            "Examples:\n"
+            "  p4-cache-access prefix depot/main/src/\n"
+            "  p4-cache-access prefix depot/main/ --limit 50 --format csv\n"
+        );
+    } else if (strcmp(cmd, "stale") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access stale --before <time> [--limit <N>]\n"
+            "                             [--output <file>] [--format csv|tsv]\n"
+            "\n"
+            "Find files not accessed since the given time. Performs a full\n"
+            "database scan, filtering entries with timestamps older than\n"
+            "the threshold. Progress is reported to stderr every 10M entries.\n"
+            "\n"
+            "The --before argument accepts:\n"
+            "  Duration:  30d (days), 6h (hours), 90m (minutes), 3600s (seconds)\n"
+            "  Epoch:     1708387200 (absolute Unix timestamp)\n"
+            "\n"
+            "Output columns: path, epoch_seconds, ISO-8601 timestamp\n"
+            "\n"
+            "Options:\n"
+            "  --before <time>   Required. Cutoff time for staleness\n"
+            "  --limit <N>       Stop after N stale entries\n"
+            "  --format csv|tsv  Output format (default: tsv)\n"
+            "  --output <file>   Write to file instead of stdout\n"
+            "\n"
+            "Examples:\n"
+            "  p4-cache-access stale --before 30d\n"
+            "  p4-cache-access stale --before 7d --limit 1000 --output stale.tsv\n"
+            "  p4-cache-access stale --before 1708387200 --format csv\n"
+        );
+    } else if (strcmp(cmd, "export") == 0) {
+        fprintf(stderr,
+            "Usage: p4-cache-access export [--format csv|tsv] [--limit <N>]\n"
+            "                              [--output <file>]\n"
+            "\n"
+            "Dump the entire access database. Progress is reported to stderr\n"
+            "every 10M entries. For large databases (billions of entries),\n"
+            "use --output to write directly to a file with buffered I/O.\n"
+            "\n"
+            "Output columns: path, epoch_seconds, ISO-8601 timestamp\n"
+            "\n"
+            "Options:\n"
+            "  --format csv|tsv  Output format (default: tsv)\n"
+            "  --limit <N>       Stop after N entries\n"
+            "  --output <file>   Write to file instead of stdout (1MB buffer)\n"
+            "\n"
+            "Examples:\n"
+            "  p4-cache-access export\n"
+            "  p4-cache-access export --format csv --output access_dump.csv\n"
+            "  p4-cache-access export --limit 100000\n"
+        );
+    } else {
+        fprintf(stderr, "Unknown command: %s\n\n", cmd);
+        print_usage();
+    }
 }
 
 }  // namespace
@@ -115,7 +239,7 @@ int main(int argc, char* argv[]) {
             if (++i >= argc) { fprintf(stderr, "--output requires argument\n"); return 1; }
             output_file = argv[i];
         } else if (arg == "--help" || arg == "-h") {
-            print_usage();
+            print_usage(subcommand.empty() ? nullptr : subcommand.c_str());
             return 0;
         } else if (arg[0] != '-' && subcommand.empty()) {
             subcommand = arg;
@@ -132,6 +256,20 @@ int main(int argc, char* argv[]) {
 
     if (subcommand.empty()) {
         print_usage();
+        return 1;
+    }
+
+    // Validate required subcommand arguments before opening the DB
+    if (subcommand == "get" && get_path.empty()) {
+        print_usage("get");
+        return 1;
+    }
+    if (subcommand == "prefix" && prefix_str.empty()) {
+        print_usage("prefix");
+        return 1;
+    }
+    if (subcommand == "stale" && before_str.empty()) {
+        print_usage("stale");
         return 1;
     }
 
@@ -236,13 +374,6 @@ int main(int argc, char* argv[]) {
             fprintf(out, "%zu\n", stat.ms_entries);
         }
     } else if (subcommand == "get") {
-        if (get_path.empty()) {
-            fprintf(stderr, "Usage: p4-cache-access get <path>\n");
-            mdb_txn_abort(txn);
-            mdb_env_close(env);
-            return 1;
-        }
-
         MDB_val k = {get_path.size(), const_cast<char*>(get_path.data())};
         MDB_val v;
         rc = mdb_get(txn, dbi, &k, &v);
@@ -257,13 +388,6 @@ int main(int argc, char* argv[]) {
             fprintf(out, "%" PRIu64 "\t%s\n", ts, time_buf);
         }
     } else if (subcommand == "prefix") {
-        if (prefix_str.empty()) {
-            fprintf(stderr, "Usage: p4-cache-access prefix <prefix>\n");
-            mdb_txn_abort(txn);
-            mdb_env_close(env);
-            return 1;
-        }
-
         MDB_cursor* cursor = nullptr;
         rc = mdb_cursor_open(txn, dbi, &cursor);
         if (rc) {
@@ -292,13 +416,6 @@ int main(int argc, char* argv[]) {
             mdb_cursor_close(cursor);
         }
     } else if (subcommand == "stale") {
-        if (before_str.empty()) {
-            fprintf(stderr, "Usage: p4-cache-access stale --before <time>\n");
-            mdb_txn_abort(txn);
-            mdb_env_close(env);
-            return 1;
-        }
-
         uint64_t threshold = parse_before_time(before_str.c_str());
 
         MDB_cursor* cursor = nullptr;

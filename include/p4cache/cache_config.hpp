@@ -75,6 +75,7 @@ struct CacheConfig {
     size_t access_flush_interval_secs = 5;
     size_t access_sync_interval_secs = 60;
     uint64_t access_mapsize_gb = 512;
+    std::filesystem::path access_db_path;  // Override: shared LMDB path (default: <state_dir>/access/)
 
     /// Parse configuration from command line arguments.
     /// Returns empty optional on error (prints usage to stderr).

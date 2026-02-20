@@ -119,6 +119,7 @@ Upload concurrency (concurrent PUT operations per upload cycle) defaults to 16 a
 | `--no-access-log` | off | Disable the access log (no access tracking) |
 | `--access-batch-size <N>` | 10000 | Write batch threshold (entries before flush) |
 | `--access-mapsize-gb <N>` | 512 | LMDB map size for access DB in GB |
+| `--access-db-path <path>` | `<state_dir>/access/` | Access log LMDB directory. Override to share one DB across multiple daemons. |
 
 ## JSON Configuration
 
@@ -186,6 +187,7 @@ Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaul
 | `access_flush_interval_secs` | integer | Seconds between periodic batch flushes (default 5) |
 | `access_sync_interval_secs` | integer | Seconds between `mdb_env_sync()` calls (default 60) |
 | `access_mapsize_gb` | integer | LMDB map size for access DB in GB (default 512) |
+| `access_db_path` | string | Access log LMDB directory (default: `<state_dir>/access/`) |
 
 ### Backend Object Fields
 

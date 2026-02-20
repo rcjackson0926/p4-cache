@@ -1491,7 +1491,9 @@ void DepotCache::shim_server_loop() {
 // --- Access Log ---
 
 void DepotCache::init_access_log() {
-    auto access_dir = config_.state_dir / "access";
+    auto access_dir = config_.access_db_path.empty()
+                          ? config_.state_dir / "access"
+                          : config_.access_db_path;
     std::filesystem::create_directories(access_dir);
 
     int rc = mdb_env_create(&access_env_);
