@@ -25,12 +25,14 @@ Key types:
 
 The core engine. Owns:
 - LMDB manifest database (3 named databases)
+- LMDB access log database (separate environment, see below)
 - Primary and secondary `StorageBackend` instances
 - Upload worker thread + upload thread pool
 - Eviction worker thread
 - Restore thread pool
 - Shim Unix socket server thread
 - Stats reporter thread
+- Access log receiver and writer threads
 
 ### 3. DepotWatcher (`depot_watcher.hpp` / `depot_watcher.cpp`)
 
@@ -40,11 +42,12 @@ In read-only mode, fanotify is not initialized — the watcher thread exists onl
 
 ### 4. Shim (`shim.cpp`)
 
-An `LD_PRELOAD` library that hooks `open()` and `openat()` in P4d's process space. It handles one scenario:
+An `LD_PRELOAD` library that hooks `open()` and `openat()` in P4d's process space. It handles two scenarios:
 
 - **ENOENT interception** — when `open()` returns `ENOENT` for a path under the depot, the shim asks the daemon to fetch the file from remote storage, then retries.
+- **Access recording** — when `open()` succeeds for a depot file, the shim records the path in a per-thread ring buffer. When the buffer fills (~32 KB / ~400 paths), it sends a datagram to the daemon's access log socket (fire-and-forget, ~7ns per record on the hot path).
 
-Since evicted files are deleted (not truncated to 0-byte stubs), the hot path for `open()` is just the raw syscall — no `fstat()` needed. This avoids a syscall overhead on every successful depot file open.
+Since evicted files are deleted (not truncated to 0-byte stubs), the hot path for `open()` is just the raw syscall plus access recording — no `fstat()` needed.
 
 The shim maintains a per-thread negative cache (up to 10,000 entries) to avoid repeated lookups for paths not in storage.
 
@@ -56,7 +59,13 @@ Key classes:
 - **`MetricsExporter`** — owns the registry, all metric families, and the writer thread. Receives pointers to `DepotCache` and `DepotWatcher` for periodic gauge snapshots.
 - **`ScopedTimer`** — RAII class that observes a histogram with elapsed duration on destruction. Used to instrument upload, restore, eviction, and shim request durations.
 
-### 6. main.cpp
+### 6. Access Tool (`access_tool.cpp`)
+
+Standalone `p4-cache-access` binary for querying the access log database. Opens the LMDB access log read-only. Only links against LMDB (no meridian, no curl, no prometheus).
+
+Subcommands: `stat`, `count`, `get <path>`, `prefix <prefix>`, `stale --before <time>`, `export`.
+
+### 7. main.cpp
 
 Entry point. Handles daemonization (double-fork), log redirection, signal handling (SIGINT/SIGTERM), and orchestrates startup/shutdown of `DepotCache`, `DepotWatcher`, and `MetricsExporter`.
 
@@ -93,9 +102,27 @@ upload_worker_loop()
 
 ```
 P4d opens file ──> open() succeeds ──> normal read
+                         |
+                         v
+              libp4shim.so: record_access()
+                 memcpy path into thread-local buffer (~7ns)
+                         |
+                         v  (when buffer fills ~32KB)
+              flush_access_buffer(): sendto() datagram to daemon
+                         |
+                         v
+              DepotCache::access_receiver_loop()
+                 parse paths, accumulate in batch map
+                         |
+                         v  (every 5s or 10K entries)
+              DepotCache::access_writer_loop()
+                 sort batch, mdb_put() in single txn
+                         |
+                         v
+              access LMDB: key=depot-relative path, value=8B epoch timestamp
 ```
 
-No daemon involvement. Full NVMe speed. No fstat() syscall overhead.
+Access recording is fire-and-forget and never blocks the read path. No fstat() syscall overhead.
 
 ### Read Path — Evicted / Cold (file not on NVMe)
 
@@ -150,6 +177,8 @@ Eviction deletes files entirely — no 0-byte stubs, no "evicted" state. This av
 | Restore pool (N threads) | both | Concurrent GET + file write operations (`restore_threads`, default 16) |
 | Stats reporter | both | Logs stats every `stats_interval_secs` (default 60) |
 | Metrics writer | both (if configured) | Writes `.prom` file every `metrics_interval_secs` (default 15) |
+| Access receiver | both (if enabled) | Reads datagram socket, parses paths, accumulates batch |
+| Access writer | both (if enabled) | Periodic sorted LMDB batch flush (every 5s or 10K entries) |
 | Watcher event loop | read-write only | Reads fanotify events, calls `on_file_written()` |
 
 ### Concurrency Design
@@ -205,6 +234,54 @@ State enum: 0=dirty, 1=uploading, 2=clean. No "evicted" state.
 | uploading → dirty (failure) | update | put | — |
 | clean → deleted (eviction) | del | — | del |
 | fetch_for_shim → clean | put | — | put |
+
+## LMDB Access Log
+
+The access log is a separate LMDB environment at `<depot>/.p4cache/access/`, independent from the manifest. It permanently records when each depot file was last read through the cache.
+
+### Why a Separate Environment?
+
+- **Independent write lock**: High-frequency access writes don't contend with upload/eviction transactions on the manifest
+- **Relaxed durability**: Uses `MDB_WRITEMAP | MDB_MAPASYNC | MDB_NOSYNC` for maximum write throughput. Losing the last 60s of access data on crash is acceptable.
+- **Different scale**: Access DB may grow to 250 GB+ for billion-file depots while manifest stays bounded by cache size
+
+### Schema
+
+Single unnamed database (no `mdb_env_set_maxdbs` call needed):
+
+| Key | Value |
+|-----|-------|
+| depot-relative path (string) | 8-byte little-endian epoch timestamp |
+
+### Write Optimization
+
+1. **Pre-sorted batch inserts**: Paths are sorted lexicographically before `mdb_put()`, giving sequential B-tree leaf access with ~85-90% page fill factor
+2. **In-memory deduplication**: `unordered_map<string, uint64_t>` collapses repeated opens of the same file into one write (keeps latest timestamp)
+3. **Periodic sync**: `mdb_env_sync()` every 60s bounds worst-case data loss
+4. **Fire-and-forget IPC**: Shim sends datagrams with `MSG_DONTWAIT`; if the socket buffer is full, events are silently dropped
+
+### Crash Safety
+
+| Failure | Impact |
+|---------|--------|
+| Daemon crash | Lose up to 60s of access events (last sync interval) + in-memory batch |
+| OS crash / power loss | Same; LMDB rolls back to last `mdb_env_sync()` point |
+| Socket buffer full | Individual datagrams silently dropped |
+| Disk full | `mdb_txn_commit()` returns `MDB_MAP_FULL`; daemon logs error, drops batch, continues |
+
+Access log failure never affects cache correctness (uploads, evictions, restores).
+
+### Query Tool
+
+The `p4-cache-access` binary opens the access LMDB read-only for analysis:
+
+```bash
+p4-cache-access --db .p4cache/access stat       # Entry count, tree depth, DB size
+p4-cache-access --db .p4cache/access get <path>  # Last access time for one file
+p4-cache-access --db .p4cache/access prefix dir/ # Files under a directory
+p4-cache-access --db .p4cache/access stale --before 30d  # Files not accessed in 30 days
+p4-cache-access --db .p4cache/access export --format csv  # Full dump
+```
 
 ## Storage Backend Integration
 

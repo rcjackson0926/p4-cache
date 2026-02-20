@@ -15,6 +15,8 @@
 #include <lmdb.h>
 #include <sstream>
 #include <vector>
+#include <algorithm>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -250,6 +252,11 @@ DepotCache::~DepotCache() {
         mdb_env_ = nullptr;
     }
 
+    if (access_env_) {
+        mdb_env_close(access_env_);
+        access_env_ = nullptr;
+    }
+
     if (shim_sock_fd_ >= 0) {
         close(shim_sock_fd_);
         auto sock_path = config_.state_dir / "shim.sock";
@@ -317,6 +324,17 @@ std::string DepotCache::start() {
         stats_thread_ = std::thread(&DepotCache::stats_reporter_loop, this);
     }
 
+    // Start access log (non-fatal on failure)
+    if (config_.access_log_enabled) {
+        try {
+            init_access_log();
+            access_receiver_thread_ = std::thread(&DepotCache::access_receiver_loop, this);
+            access_writer_thread_ = std::thread(&DepotCache::access_writer_loop, this);
+        } catch (const std::exception& e) {
+            log_error("Access log init failed (continuing without): %s", e.what());
+        }
+    }
+
     return {};
 }
 
@@ -338,6 +356,9 @@ void DepotCache::stop() {
         unlink(sock_path.c_str());
     }
 
+    // Close access log socket to unblock receiver
+    close_access_log();
+
     // Join upload threads
     for (auto& t : upload_threads_) {
         if (t.joinable()) t.join();
@@ -347,6 +368,11 @@ void DepotCache::stop() {
     if (eviction_thread_.joinable()) eviction_thread_.join();
     if (shim_thread_.joinable()) shim_thread_.join();
     if (stats_thread_.joinable()) stats_thread_.join();
+
+    // Join access log threads
+    access_cv_.notify_all();
+    if (access_receiver_thread_.joinable()) access_receiver_thread_.join();
+    if (access_writer_thread_.joinable()) access_writer_thread_.join();
 
     // Shutdown thread pools
     if (upload_pool_) upload_pool_->shutdown(true);
@@ -1460,6 +1486,270 @@ void DepotCache::shim_server_loop() {
             close(client_fd);
         });
     }
+}
+
+// --- Access Log ---
+
+void DepotCache::init_access_log() {
+    auto access_dir = config_.state_dir / "access";
+    std::filesystem::create_directories(access_dir);
+
+    int rc = mdb_env_create(&access_env_);
+    if (rc) throw std::runtime_error("access mdb_env_create: " + std::string(mdb_strerror(rc)));
+
+    rc = mdb_env_set_mapsize(access_env_, config_.access_mapsize_gb * 1024ULL * 1024 * 1024);
+    if (rc) {
+        mdb_env_close(access_env_);
+        access_env_ = nullptr;
+        throw std::runtime_error("access mdb_env_set_mapsize: " + std::string(mdb_strerror(rc)));
+    }
+
+    // No named DBs needed — use the default (unnamed) database
+    // MDB_NOSYNC: don't fsync on commit (acceptable data loss for access log)
+    // MDB_WRITEMAP: writable mmap for better write throughput
+    // MDB_MAPASYNC: async dirty page writeback with MDB_WRITEMAP
+    // MDB_NOTLS: don't use thread-local storage for reader tracking
+    //   (required since access log txns run from multiple threads)
+    unsigned int flags = MDB_NOSYNC | MDB_WRITEMAP | MDB_MAPASYNC | MDB_NOTLS;
+    rc = mdb_env_open(access_env_, access_dir.c_str(), flags, 0664);
+    if (rc) {
+        mdb_env_close(access_env_);
+        access_env_ = nullptr;
+        throw std::runtime_error("access mdb_env_open: " + std::string(mdb_strerror(rc)));
+    }
+
+    // Open default (unnamed) database
+    MDB_txn* txn = nullptr;
+    rc = mdb_txn_begin(access_env_, nullptr, 0, &txn);
+    if (rc) throw std::runtime_error("access mdb_txn_begin: " + std::string(mdb_strerror(rc)));
+
+    rc = mdb_dbi_open(txn, nullptr, MDB_CREATE, &access_dbi_);
+    if (rc) { mdb_txn_abort(txn); throw std::runtime_error("access mdb_dbi_open: " + std::string(mdb_strerror(rc))); }
+
+    rc = mdb_txn_commit(txn);
+    if (rc) throw std::runtime_error("access mdb_txn_commit: " + std::string(mdb_strerror(rc)));
+
+    // Create and bind datagram socket for receiving access events from shim
+    auto sock_path = config_.state_dir / "access.sock";
+    unlink(sock_path.c_str());
+
+    access_sock_fd_ = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (access_sock_fd_ < 0) throw std::runtime_error("access socket: " + std::string(strerror(errno)));
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (bind(access_sock_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(access_sock_fd_);
+        access_sock_fd_ = -1;
+        throw std::runtime_error("access bind: " + std::string(strerror(errno)));
+    }
+
+    // Set 4MB receive buffer
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(access_sock_fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    chmod(sock_path.c_str(), 0666);
+
+    log_info("Access log initialized: %s (mapsize=%lu GB)", access_dir.c_str(), config_.access_mapsize_gb);
+}
+
+void DepotCache::close_access_log() {
+    if (access_sock_fd_ >= 0) {
+        shutdown(access_sock_fd_, SHUT_RDWR);
+        close(access_sock_fd_);
+        access_sock_fd_ = -1;
+        auto sock_path = config_.state_dir / "access.sock";
+        unlink(sock_path.c_str());
+    }
+}
+
+void DepotCache::access_receiver_loop() {
+    char buf[65536];
+    uint64_t timestamp = static_cast<uint64_t>(now_epoch());
+    uint64_t msg_count = 0;
+
+    while (running_.load(std::memory_order_relaxed)) {
+        struct pollfd pfd;
+        pfd.fd = access_sock_fd_;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int ret = poll(&pfd, 1, 1000);  // 1s timeout
+        if (ret <= 0) continue;
+        if (!running_.load(std::memory_order_relaxed)) break;
+
+        ssize_t n = recvfrom(access_sock_fd_, buf, sizeof(buf), 0, nullptr, nullptr);
+        if (n <= 0) continue;
+
+        // Refresh timestamp every 1024 messages to amortize syscall
+        if (++msg_count % 1024 == 0) {
+            timestamp = static_cast<uint64_t>(now_epoch());
+        }
+
+        // Parse newline-delimited paths
+        size_t events = 0;
+        {
+            std::lock_guard<std::mutex> lock(access_mutex_);
+            const char* start = buf;
+            const char* end = buf + n;
+            while (start < end) {
+                const char* nl = static_cast<const char*>(memchr(start, '\n', end - start));
+                if (!nl) break;
+                size_t len = nl - start;
+                if (len > 0) {
+                    std::string path(start, len);
+                    access_batch_[std::move(path)] = timestamp;
+                    ++events;
+                }
+                start = nl + 1;
+            }
+        }
+
+        {
+            std::lock_guard lock(stats_mutex_);
+            stats_.access_events_received += events;
+        }
+        if (metrics_) {
+            metrics_->access_events_total().Increment(static_cast<double>(events));
+        }
+
+        // Notify writer if batch is large enough
+        {
+            std::lock_guard<std::mutex> lock(access_mutex_);
+            if (access_batch_.size() >= config_.access_batch_size) {
+                access_cv_.notify_one();
+            }
+        }
+    }
+}
+
+void DepotCache::access_writer_loop() {
+    if (!access_env_) return;
+
+    auto last_sync = std::chrono::steady_clock::now();
+
+    while (running_.load(std::memory_order_relaxed)) {
+        // Wait for batch threshold or flush interval
+        {
+            std::unique_lock<std::mutex> lock(access_mutex_);
+            access_cv_.wait_for(lock,
+                std::chrono::seconds(config_.access_flush_interval_secs),
+                [this] {
+                    return !running_.load(std::memory_order_relaxed) ||
+                           access_batch_.size() >= config_.access_batch_size;
+                });
+        }
+
+        // Swap out the batch under lock
+        std::unordered_map<std::string, uint64_t> batch;
+        {
+            std::lock_guard<std::mutex> lock(access_mutex_);
+            batch.swap(access_batch_);
+        }
+
+        if (batch.empty()) continue;
+
+        // Sort lexicographically for sequential B-tree access
+        std::vector<std::pair<std::string, uint64_t>> sorted(batch.begin(), batch.end());
+        batch.clear();
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        std::optional<ScopedTimer> timer;
+        if (metrics_) timer.emplace(metrics_->access_batch_duration());
+
+        // Write batch to LMDB in a single transaction
+        MDB_txn* txn = nullptr;
+        int rc = mdb_txn_begin(access_env_, nullptr, 0, &txn);
+        if (rc) {
+            log_error("Access log txn_begin failed: %s", mdb_strerror(rc));
+            continue;
+        }
+
+        for (auto& [path, ts] : sorted) {
+            uint64_t le_ts = ts;  // Already native endian; x86 is little-endian
+            MDB_val k = {path.size(), const_cast<char*>(path.data())};
+            MDB_val v = {sizeof(le_ts), &le_ts};
+            mdb_put(txn, access_dbi_, &k, &v, 0);
+        }
+
+        rc = mdb_txn_commit(txn);
+        if (rc) {
+            log_error("Access log commit failed: %s", mdb_strerror(rc));
+        } else {
+            {
+                std::lock_guard lock(stats_mutex_);
+                stats_.access_batches_written++;
+            }
+            if (metrics_) {
+                metrics_->access_batches_total().Increment();
+            }
+            if (config_.verbose) {
+                log_info("Access log: wrote %zu entries", sorted.size());
+            }
+        }
+
+        // Periodic sync
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_sync).count()
+            >= static_cast<int64_t>(config_.access_sync_interval_secs)) {
+            mdb_env_sync(access_env_, 1);
+            last_sync = now;
+        }
+    }
+
+    // Final flush on shutdown
+    {
+        std::unordered_map<std::string, uint64_t> batch;
+        {
+            std::lock_guard<std::mutex> lock(access_mutex_);
+            batch.swap(access_batch_);
+        }
+
+        if (!batch.empty() && access_env_) {
+            std::vector<std::pair<std::string, uint64_t>> sorted(batch.begin(), batch.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+
+            MDB_txn* txn = nullptr;
+            int rc = mdb_txn_begin(access_env_, nullptr, 0, &txn);
+            if (rc == 0) {
+                for (auto& [path, ts] : sorted) {
+                    uint64_t le_ts = ts;
+                    MDB_val k = {path.size(), const_cast<char*>(path.data())};
+                    MDB_val v = {sizeof(le_ts), &le_ts};
+                    mdb_put(txn, access_dbi_, &k, &v, 0);
+                }
+                mdb_txn_commit(txn);
+            }
+        }
+    }
+
+    // Final sync
+    if (access_env_) {
+        mdb_env_sync(access_env_, 0);
+    }
+}
+
+uint64_t DepotCache::access_db_entries() const {
+    if (!access_env_) return 0;
+    MDB_txn* txn = nullptr;
+    int rc = mdb_txn_begin(access_env_, nullptr, MDB_RDONLY, &txn);
+    if (rc) {
+        log_error("access_db_entries: txn_begin failed: rc=%d %s", rc, mdb_strerror(rc));
+        return 0;
+    }
+    MDB_stat stat;
+    rc = mdb_stat(txn, access_dbi_, &stat);
+    mdb_txn_abort(txn);
+    if (rc) {
+        log_error("access_db_entries: mdb_stat failed: rc=%d %s", rc, mdb_strerror(rc));
+        return 0;
+    }
+    return stat.ms_entries;
 }
 
 // --- Stats ---

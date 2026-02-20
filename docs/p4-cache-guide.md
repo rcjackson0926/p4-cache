@@ -89,6 +89,9 @@ Uploads go to primary only. Restores try primary first, then secondary.
 | `--stats-interval <secs>` | Stats logging interval (default: 60) |
 | `--metrics-file <path>` | Prometheus `.prom` file for node_exporter |
 | `--metrics-interval <secs>` | Metrics write interval (default: 15) |
+| `--no-access-log` | Disable access log tracking |
+| `--access-batch-size <N>` | Access log batch threshold (default: 10000) |
+| `--access-mapsize-gb <N>` | Access log LMDB map size (default: 512 GB) |
 | `--config <path>` | JSON config file |
 | `--primary-prefix <prefix>` | Storage key prefix (default: depot dir name) |
 | `--primary-no-verify-ssl` | Disable SSL verification |
@@ -128,6 +131,7 @@ LD_PRELOAD=/usr/local/lib/libp4shim.so P4CACHE_DEPOT=/mnt/nvme/depot \
 |---------|-------------|
 | `P4CACHE_DEPOT` | Depot path to intercept |
 | `P4CACHE_SOCK` | Socket path (default: `<depot>/.p4cache/shim.sock`) |
+| `P4CACHE_ACCESS_SOCK` | Access log socket (default: `<depot>/.p4cache/access.sock`) |
 
 ## Full Production Example
 
@@ -188,6 +192,41 @@ cat /var/lib/node_exporter/textfile/p4cache.prom
 ```
 
 Exported metrics include counters (uploads, restores, evictions, shim requests), gauges (file states, cache size, queue depths), and histograms (operation durations). All metrics carry `depot` and `mode` labels.
+
+## Access Log
+
+The daemon permanently tracks when each depot file was last read through the cache. This enables identifying stale files (never accessed, candidates for archival) and understanding depot access patterns.
+
+### Query Tool
+
+```bash
+# Entry count and DB stats
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access stat
+
+# Look up when a specific file was last accessed
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access get depot/main/src/foo.cpp
+
+# List files under a directory prefix
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access prefix depot/main/src/
+
+# Find files not accessed in 30 days
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access stale --before 30d
+
+# Export entire access database
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access export --format csv --output access.csv
+```
+
+Default `--db` path: `$P4CACHE_DEPOT/.p4cache/access/` or `.p4cache/access/` under CWD.
+
+### Disabling
+
+If you don't need access tracking, disable it to avoid the overhead:
+
+```bash
+p4-cache --no-access-log ...
+```
+
+Or in JSON config: `"access_log_enabled": false`
 
 ## Operational Recommendations
 

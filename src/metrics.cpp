@@ -84,6 +84,20 @@ MetricsExporter::MetricsExporter(const std::filesystem::path& prom_file_path,
     watcher_errors_ = &watcher_family.Add({{"type", "error"}});
     watcher_self_filtered_ = &watcher_family.Add({{"type", "self_filtered"}});
 
+    access_events_total_ = &prometheus::BuildCounter()
+        .Name("p4cache_access_events_total")
+        .Help("Total access log events received")
+        .Labels(labels)
+        .Register(*registry_)
+        .Add({});
+
+    access_batches_total_ = &prometheus::BuildCounter()
+        .Name("p4cache_access_batches_total")
+        .Help("Total access log batches written to LMDB")
+        .Labels(labels)
+        .Register(*registry_)
+        .Add({});
+
     // --- Gauges ---
 
     auto gauge_reg = [&](const std::string& name, const std::string& help) -> prometheus::Gauge& {
@@ -103,6 +117,7 @@ MetricsExporter::MetricsExporter(const std::filesystem::path& prom_file_path,
     cache_max_bytes_ = &gauge_reg("p4cache_cache_max_bytes", "Maximum cache size in bytes");
     upload_queue_pending_ = &gauge_reg("p4cache_upload_queue_pending", "Pending upload tasks");
     restore_queue_pending_ = &gauge_reg("p4cache_restore_queue_pending", "Pending restore tasks");
+    access_db_entries_ = &gauge_reg("p4cache_access_db_entries", "Access log database entries");
 
     // --- Histograms ---
 
@@ -137,6 +152,14 @@ MetricsExporter::MetricsExporter(const std::filesystem::path& prom_file_path,
         .Register(*registry_)
         .Add({}, prometheus::Histogram::BucketBoundaries{
             0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30});
+
+    access_batch_duration_ = &prometheus::BuildHistogram()
+        .Name("p4cache_access_batch_duration_seconds")
+        .Help("Access log batch write duration in seconds")
+        .Labels(labels)
+        .Register(*registry_)
+        .Add({}, prometheus::Histogram::BucketBoundaries{
+            0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10});
 }
 
 MetricsExporter::~MetricsExporter() {
@@ -193,6 +216,7 @@ void MetricsExporter::update_gauges() {
         cache_max_bytes_->Set(static_cast<double>(cache_->max_cache_bytes()));
         upload_queue_pending_->Set(static_cast<double>(cache_->upload_pending()));
         restore_queue_pending_->Set(static_cast<double>(cache_->restore_pending()));
+        access_db_entries_->Set(static_cast<double>(cache_->access_db_entries()));
     }
 
     if (watcher_) {

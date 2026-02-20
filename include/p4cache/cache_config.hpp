@@ -69,6 +69,13 @@ struct CacheConfig {
     std::filesystem::path metrics_file;    // e.g. /var/lib/node_exporter/textfile/p4cache.prom
     size_t metrics_interval_secs = 15;
 
+    // Access log (permanent LMDB database tracking last read time per file)
+    bool access_log_enabled = true;
+    size_t access_batch_size = 10000;
+    size_t access_flush_interval_secs = 5;
+    size_t access_sync_interval_secs = 60;
+    uint64_t access_mapsize_gb = 512;
+
     /// Parse configuration from command line arguments.
     /// Returns empty optional on error (prints usage to stderr).
     static std::optional<CacheConfig> from_args(int argc, char* argv[]);

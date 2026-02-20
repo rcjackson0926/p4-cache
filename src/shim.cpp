@@ -40,6 +40,21 @@ const char* depot_path = nullptr;
 size_t depot_path_len = 0;
 std::string sock_path;
 
+// --- Access log recording ---
+constexpr size_t ACCESS_BUF_SIZE = 32768;         // 32KB per thread
+constexpr size_t ACCESS_FLUSH_THRESHOLD = 30720;   // Flush at ~94% full
+
+struct AccessBuffer {
+    char data[ACCESS_BUF_SIZE];
+    size_t pos = 0;
+};
+
+thread_local AccessBuffer* access_buf = nullptr;
+int access_dgram_fd = -1;
+struct sockaddr_un access_daemon_addr;
+socklen_t access_daemon_addr_len = 0;
+bool access_initialized = false;
+
 // Negative cache: paths we know aren't in storage (avoid repeated lookups)
 // Thread-local to avoid locking overhead
 thread_local std::unordered_set<std::string>* negative_cache = nullptr;
@@ -110,6 +125,84 @@ bool request_fetch(const char* path) {
     return strncmp(buf, "OK ", 3) == 0;
 }
 
+void init_access_socket() {
+    if (access_initialized) return;
+
+    access_dgram_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (access_dgram_fd < 0) return;
+
+    memset(&access_daemon_addr, 0, sizeof(access_daemon_addr));
+    access_daemon_addr.sun_family = AF_UNIX;
+
+    const char* access_sock_env = getenv("P4CACHE_ACCESS_SOCK");
+    if (access_sock_env) {
+        strncpy(access_daemon_addr.sun_path, access_sock_env,
+                sizeof(access_daemon_addr.sun_path) - 1);
+    } else if (depot_path) {
+        std::string path = std::string(depot_path, depot_path_len) + "/.p4cache/access.sock";
+        strncpy(access_daemon_addr.sun_path, path.c_str(),
+                sizeof(access_daemon_addr.sun_path) - 1);
+    } else {
+        close(access_dgram_fd);
+        access_dgram_fd = -1;
+        return;
+    }
+
+    access_daemon_addr_len = sizeof(access_daemon_addr);
+    access_initialized = true;
+}
+
+void flush_access_buffer() {
+    if (!access_buf || access_buf->pos == 0) return;
+    if (access_dgram_fd < 0) {
+        access_buf->pos = 0;
+        return;
+    }
+
+    // Fire-and-forget: silently drop on EAGAIN/EWOULDBLOCK
+    sendto(access_dgram_fd, access_buf->data, access_buf->pos, MSG_DONTWAIT,
+           reinterpret_cast<struct sockaddr*>(&access_daemon_addr), access_daemon_addr_len);
+    access_buf->pos = 0;
+}
+
+void record_access(const char* pathname) {
+    if (!depot_path || access_dgram_fd < 0) return;
+
+    // Must be under depot path
+    if (!starts_with(pathname, depot_path, depot_path_len)) return;
+
+    // Strip depot prefix
+    const char* rel = pathname + depot_path_len;
+    if (*rel == '/') rel++;
+
+    // Skip .p4cache directory
+    if (strncmp(rel, ".p4cache/", 9) == 0 || strcmp(rel, ".p4cache") == 0) return;
+
+    size_t rel_len = strlen(rel);
+    if (rel_len == 0) return;
+
+    // Get/create thread-local buffer
+    if (!access_buf) {
+        access_buf = new AccessBuffer();
+    }
+
+    // Check if path + newline fits
+    size_t needed = rel_len + 1;  // path + '\n'
+    if (access_buf->pos + needed > ACCESS_BUF_SIZE) {
+        flush_access_buffer();
+        // If single path is too large for buffer, skip it
+        if (needed > ACCESS_BUF_SIZE) return;
+    }
+
+    memcpy(access_buf->data + access_buf->pos, rel, rel_len);
+    access_buf->pos += rel_len;
+    access_buf->data[access_buf->pos++] = '\n';
+
+    if (access_buf->pos >= ACCESS_FLUSH_THRESHOLD) {
+        flush_access_buffer();
+    }
+}
+
 void ensure_initialized() {
     if (initialized) return;
 
@@ -140,6 +233,9 @@ void ensure_initialized() {
     }
 
     initialized = true;
+
+    // Initialize access log socket (after depot_path is set)
+    init_access_socket();
 }
 
 /// Check if this path should be intercepted on ENOENT.
@@ -194,7 +290,10 @@ extern "C" int open(const char* pathname, int flags, ...) {
     // Try the real open first
     int fd = real_open(pathname, flags, mode);
 
-    if (fd >= 0) return fd;           // File exists — fast path
+    if (fd >= 0) {                    // File exists — fast path
+        record_access(pathname);
+        return fd;
+    }
     if (errno != ENOENT) return fd;   // Non-ENOENT error — pass through
 
     // ENOENT — check if we should intercept
@@ -229,7 +328,14 @@ extern "C" int openat(int dirfd, const char* pathname, int flags, ...) {
 
     int fd = real_openat(dirfd, pathname, flags, mode);
 
-    if (fd >= 0) return fd;           // File exists — fast path
+    if (fd >= 0) {                    // File exists — fast path
+        // Only record absolute paths (P4d uses absolute paths for depot files;
+        // resolving CWD for relative paths would be too expensive)
+        if (pathname[0] == '/') {
+            record_access(pathname);
+        }
+        return fd;
+    }
     if (errno != ENOENT) return fd;   // Non-ENOENT error — pass through
 
     // Only intercept absolute paths or paths relative to AT_FDCWD

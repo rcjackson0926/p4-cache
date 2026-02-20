@@ -83,11 +83,16 @@ public:
     prometheus::Counter& watcher_errors() { return *watcher_errors_; }
     prometheus::Counter& watcher_self_filtered() { return *watcher_self_filtered_; }
 
+    // --- Access log counter accessors ---
+    prometheus::Counter& access_events_total() { return *access_events_total_; }
+    prometheus::Counter& access_batches_total() { return *access_batches_total_; }
+
     // --- Histogram accessors ---
     prometheus::Histogram& upload_duration() { return *upload_duration_; }
     prometheus::Histogram& restore_duration() { return *restore_duration_; }
     prometheus::Histogram& eviction_batch_duration() { return *eviction_batch_duration_; }
     prometheus::Histogram& shim_request_duration() { return *shim_request_duration_; }
+    prometheus::Histogram& access_batch_duration() { return *access_batch_duration_; }
 
 private:
     void writer_loop();
@@ -123,6 +128,8 @@ private:
     prometheus::Counter* watcher_writes_;
     prometheus::Counter* watcher_errors_;
     prometheus::Counter* watcher_self_filtered_;
+    prometheus::Counter* access_events_total_;
+    prometheus::Counter* access_batches_total_;
 
     // --- Gauges ---
     prometheus::Gauge* files_dirty_;
@@ -133,12 +140,14 @@ private:
     prometheus::Gauge* cache_max_bytes_;
     prometheus::Gauge* upload_queue_pending_;
     prometheus::Gauge* restore_queue_pending_;
+    prometheus::Gauge* access_db_entries_;
 
     // --- Histograms ---
     prometheus::Histogram* upload_duration_;
     prometheus::Histogram* restore_duration_;
     prometheus::Histogram* eviction_batch_duration_;
     prometheus::Histogram* shim_request_duration_;
+    prometheus::Histogram* access_batch_duration_;
 
     // Writer thread
     std::thread writer_thread_;

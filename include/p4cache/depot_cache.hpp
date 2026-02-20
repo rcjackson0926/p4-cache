@@ -89,10 +89,13 @@ public:
         uint64_t evictions_performed = 0;
         uint64_t shim_fetches = 0;
         uint64_t shim_not_found = 0;
+        uint64_t access_events_received = 0;
+        uint64_t access_batches_written = 0;
     };
     Stats get_stats() const;
 
     bool is_read_only() const { return config_.read_only; }
+    uint64_t access_db_entries() const;
 
     /// Set the metrics exporter (optional; null-checked at call sites).
     void set_metrics(MetricsExporter* m) { metrics_ = m; }
@@ -137,6 +140,12 @@ private:
 
     // Shim server
     void shim_server_loop();
+
+    // Access log
+    void init_access_log();
+    void close_access_log();
+    void access_receiver_loop();
+    void access_writer_loop();
 
     // Stats reporting
     void stats_reporter_loop();
@@ -195,6 +204,18 @@ private:
 
     // Shim server socket
     int shim_sock_fd_ = -1;
+
+    // Access log LMDB (separate environment)
+    MDB_env* access_env_ = nullptr;
+    MDB_dbi access_dbi_ = 0;
+
+    // Access log IPC
+    int access_sock_fd_ = -1;
+    std::thread access_receiver_thread_;
+    std::thread access_writer_thread_;
+    std::mutex access_mutex_;
+    std::unordered_map<std::string, uint64_t> access_batch_;
+    std::condition_variable access_cv_;
 
     // Stats
     mutable std::mutex stats_mutex_;

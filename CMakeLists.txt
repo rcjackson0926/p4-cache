@@ -98,6 +98,12 @@ target_link_libraries(p4-cache PRIVATE
     prometheus-cpp::core
 )
 
+# ---- Access log query tool ----
+
+add_executable(p4-cache-access src/access_tool.cpp)
+target_include_directories(p4-cache-access PRIVATE ${LMDB_INCLUDE_DIR})
+target_link_libraries(p4-cache-access PRIVATE ${LMDB_LIBRARY})
+
 # ---- LD_PRELOAD shim library ----
 
 add_library(p4shim SHARED src/shim.cpp)
@@ -137,5 +143,5 @@ target_link_libraries(test-p4-cache PRIVATE
 
 # ---- Install ----
 
-install(TARGETS p4-cache RUNTIME DESTINATION bin)
+install(TARGETS p4-cache p4-cache-access RUNTIME DESTINATION bin)
 install(TARGETS p4shim LIBRARY DESTINATION lib)

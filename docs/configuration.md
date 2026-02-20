@@ -112,6 +112,14 @@ Upload concurrency (concurrent PUT operations per upload cycle) defaults to 16 a
 | `--metrics-interval <secs>` | 15 | How often to write the `.prom` file |
 | `--config <path>` | — | Load a JSON configuration file (see below) |
 
+### Access Log
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--no-access-log` | off | Disable the access log (no access tracking) |
+| `--access-batch-size <N>` | 10000 | Write batch threshold (entries before flush) |
+| `--access-mapsize-gb <N>` | 512 | LMDB map size for access DB in GB |
+
 ## JSON Configuration
 
 Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaults; CLI flags override JSON values.
@@ -148,7 +156,11 @@ Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaul
   "verbose": false,
   "stats_interval": 60,
   "metrics_file": "/var/lib/node_exporter/textfile/p4cache.prom",
-  "metrics_interval": 15
+  "metrics_interval": 15,
+
+  "access_log_enabled": true,
+  "access_batch_size": 10000,
+  "access_mapsize_gb": 512
 }
 ```
 
@@ -169,6 +181,9 @@ Pass `--config <path>` to load a JSON file. JSON values are overlaid onto defaul
 | `stats_interval` | integer | Stats log interval in seconds |
 | `metrics_file` | string | Path to `.prom` file for Prometheus textfile collector |
 | `metrics_interval` | integer | Metrics write interval in seconds (default 15) |
+| `access_log_enabled` | bool | Enable access log tracking (default true) |
+| `access_batch_size` | integer | Entries before batch flush (default 10000) |
+| `access_mapsize_gb` | integer | LMDB map size for access DB in GB (default 512) |
 
 ### Backend Object Fields
 
@@ -198,6 +213,7 @@ Any key can be specified in the backend object — the params map is passed dire
 | `AWS_SECRET_ACCESS_KEY` | `--primary-type s3` | S3 secret key (used when `--primary-secret-key` is not set) |
 | `P4CACHE_DEPOT` | `libp4shim.so` | Depot path for the LD_PRELOAD shim |
 | `P4CACHE_SOCK` | `libp4shim.so` | Unix socket path (default: `<depot>/.p4cache/shim.sock`) |
+| `P4CACHE_ACCESS_SOCK` | `libp4shim.so` | Access log socket path (default: `<depot>/.p4cache/access.sock`) |
 
 ## Defaults
 
@@ -215,6 +231,11 @@ Any key can be specified in the backend object — the params map is passed dire
 | `restore_threads` | 16 |
 | `stats_interval_secs` | 60 |
 | `metrics_interval_secs` | 15 |
+| `access_log_enabled` | true |
+| `access_batch_size` | 10000 |
+| `access_flush_interval_secs` | 5 |
+| `access_sync_interval_secs` | 60 |
+| `access_mapsize_gb` | 512 |
 
 ## Validation Rules
 

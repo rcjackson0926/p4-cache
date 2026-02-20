@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <lmdb.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -1029,7 +1030,453 @@ static void test_depot_cache_integration() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Azure key sanitization tests
+// 6. Access log tests
+// ---------------------------------------------------------------------------
+
+/// Helper: read an access LMDB entry. Returns 0 on found, MDB_NOTFOUND, or error.
+static int access_db_get(const fs::path& access_dir, const std::string& key, uint64_t& ts_out) {
+    MDB_env* env = nullptr;
+    int rc = mdb_env_create(&env);
+    if (rc) return rc;
+    mdb_env_set_mapsize(env, 1ULL * 1024 * 1024 * 1024);
+    rc = mdb_env_open(env, access_dir.c_str(), MDB_RDONLY, 0664);
+    if (rc) { mdb_env_close(env); return rc; }
+
+    MDB_txn* txn = nullptr;
+    rc = mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
+    if (rc) { mdb_env_close(env); return rc; }
+
+    MDB_dbi dbi;
+    rc = mdb_dbi_open(txn, nullptr, 0, &dbi);
+    if (rc) { mdb_txn_abort(txn); mdb_env_close(env); return rc; }
+
+    MDB_val k = {key.size(), const_cast<char*>(key.data())};
+    MDB_val v;
+    rc = mdb_get(txn, dbi, &k, &v);
+    if (rc == 0 && v.mv_size >= 8) {
+        memcpy(&ts_out, v.mv_data, sizeof(ts_out));
+    }
+    mdb_txn_abort(txn);
+    mdb_env_close(env);
+    return rc;
+}
+
+/// Helper: count entries in an access LMDB.
+static size_t access_db_count(const fs::path& access_dir) {
+    MDB_env* env = nullptr;
+    int rc = mdb_env_create(&env);
+    if (rc) return 0;
+    mdb_env_set_mapsize(env, 1ULL * 1024 * 1024 * 1024);
+    rc = mdb_env_open(env, access_dir.c_str(), MDB_RDONLY, 0664);
+    if (rc) { mdb_env_close(env); return 0; }
+
+    MDB_txn* txn = nullptr;
+    rc = mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
+    if (rc) { mdb_env_close(env); return 0; }
+
+    MDB_dbi dbi;
+    rc = mdb_dbi_open(txn, nullptr, 0, &dbi);
+    if (rc) { mdb_txn_abort(txn); mdb_env_close(env); return 0; }
+
+    MDB_stat stat;
+    rc = mdb_stat(txn, dbi, &stat);
+    mdb_txn_abort(txn);
+    mdb_env_close(env);
+    return (rc == 0) ? stat.ms_entries : 0;
+}
+
+/// Helper: send access events to the daemon via datagram socket.
+static void send_access_events(const fs::path& sock_path, const std::string& data) {
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+
+    sendto(fd, data.data(), data.size(), 0,
+           reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    close(fd);
+}
+
+static void test_access_log() {
+    std::cout << "\n=== Access log ===" << std::endl;
+
+    auto root = make_temp_dir("p4cache-access");
+    auto depot = root / "depot";
+    auto storage = root / "storage";
+    fs::create_directories(depot);
+    fs::create_directories(storage);
+
+    // ---- basic access log ----
+    {
+        TEST(access_log_basic);
+
+        fs::remove_all(root / "state");
+
+        CacheConfig cfg;
+        cfg.depot_path = depot;
+        cfg.primary.type = "nfs";
+        cfg.primary.params["path"] = storage.string();
+        cfg.state_dir = root / "state";
+        cfg.stats_interval_secs = 0;
+        cfg.max_cache_bytes = 1ULL * 1024 * 1024 * 1024;
+        cfg.eviction_low_watermark = 800ULL * 1024 * 1024;
+        cfg.access_log_enabled = true;
+        cfg.access_batch_size = 10;   // Small batch for testing
+        cfg.access_flush_interval_secs = 1;
+        cfg.apply_defaults();
+
+        DepotCache cache(cfg);
+        auto err = cache.start();
+        ASSERT_EMPTY(err, "start");
+
+        // Wait for access socket to be ready
+        auto access_sock = cfg.state_dir / "access.sock";
+        bool sock_ready = wait_for([&]{ return fs::exists(access_sock); }, 3000);
+        ASSERT_TRUE(sock_ready, "access.sock should exist");
+
+        // Send some access events
+        std::string events = "dir1/file1.txt\ndir1/file2.txt\ndir2/file3.txt\n";
+        send_access_events(access_sock, events);
+
+        // Wait for the batch to flush (flush interval is 1s)
+        // Sleep to allow receiver to get events and writer to flush
+        auto access_dir = cfg.state_dir / "access";
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+
+        // Verify via daemon's own access_db_entries() FIRST
+        // (must be called before any external env opens the same LMDB dir,
+        //  because opening a second env with different flags can invalidate
+        //  the shared lock file's reader mutex for the first env)
+        uint64_t db_entries = cache.access_db_entries();
+        ASSERT_TRUE(db_entries >= 3,
+                    "access_db_entries should be >= 3 (got " + std::to_string(db_entries) + ")");
+
+        // Verify stats
+        auto stats = cache.get_stats();
+        ASSERT_TRUE(stats.access_events_received >= 3,
+                    "should have >= 3 access events (got " + std::to_string(stats.access_events_received) + ")");
+        ASSERT_TRUE(stats.access_batches_written >= 1,
+                    "should have >= 1 batch written (got " + std::to_string(stats.access_batches_written) + ")");
+
+        // Stop the daemon before opening external env handles for detailed verification
+        cache.stop();
+
+        size_t count = access_db_count(access_dir);
+        ASSERT_TRUE(count >= 3, "access entries should be written (got " +
+                    std::to_string(count) + ")");
+
+        // Verify specific entries
+        uint64_t ts = 0;
+        int rc = access_db_get(access_dir, "dir1/file1.txt", ts);
+        ASSERT_TRUE(rc == 0, "file1.txt should be in access DB");
+        ASSERT_TRUE(ts > 0, "timestamp should be non-zero");
+
+        rc = access_db_get(access_dir, "dir1/file2.txt", ts);
+        ASSERT_TRUE(rc == 0, "file2.txt should be in access DB");
+
+        rc = access_db_get(access_dir, "dir2/file3.txt", ts);
+        ASSERT_TRUE(rc == 0, "file3.txt should be in access DB");
+
+        PASS();
+    }
+
+    // ---- batch flush threshold ----
+    {
+        TEST(access_log_batch_flush);
+
+        fs::remove_all(root / "state");
+
+        CacheConfig cfg;
+        cfg.depot_path = depot;
+        cfg.primary.type = "nfs";
+        cfg.primary.params["path"] = storage.string();
+        cfg.state_dir = root / "state";
+        cfg.stats_interval_secs = 0;
+        cfg.max_cache_bytes = 1ULL * 1024 * 1024 * 1024;
+        cfg.eviction_low_watermark = 800ULL * 1024 * 1024;
+        cfg.access_log_enabled = true;
+        cfg.access_batch_size = 50;     // Batch threshold
+        cfg.access_flush_interval_secs = 60;  // Long interval — force flush via batch size
+        cfg.apply_defaults();
+
+        DepotCache cache(cfg);
+        auto err = cache.start();
+        ASSERT_EMPTY(err, "start");
+
+        auto access_sock = cfg.state_dir / "access.sock";
+        bool sock_ready = wait_for([&]{ return fs::exists(access_sock); }, 3000);
+        ASSERT_TRUE(sock_ready, "access.sock should exist");
+
+        // Send 100 events in batches to exceed threshold
+        for (int batch = 0; batch < 10; ++batch) {
+            std::string events;
+            for (int i = 0; i < 10; ++i) {
+                events += "batch" + std::to_string(batch) + "/file" + std::to_string(i) + ".dat\n";
+            }
+            send_access_events(access_sock, events);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Wait for entries to appear (batch threshold should trigger flush)
+        // Use daemon's own access_db_entries() to avoid opening a second env
+        bool flushed = wait_for([&]{
+            return cache.access_db_entries() >= 50;
+        }, 10000);
+        ASSERT_TRUE(flushed, "batch threshold should trigger flush: got " +
+                    std::to_string(cache.access_db_entries()));
+
+        cache.stop();
+        cache.wait();
+        PASS();
+    }
+
+    // ---- access log disabled ----
+    {
+        TEST(access_log_disabled);
+
+        fs::remove_all(root / "state");
+
+        CacheConfig cfg;
+        cfg.depot_path = depot;
+        cfg.primary.type = "nfs";
+        cfg.primary.params["path"] = storage.string();
+        cfg.state_dir = root / "state";
+        cfg.stats_interval_secs = 0;
+        cfg.max_cache_bytes = 1ULL * 1024 * 1024 * 1024;
+        cfg.eviction_low_watermark = 800ULL * 1024 * 1024;
+        cfg.access_log_enabled = false;
+        cfg.apply_defaults();
+
+        DepotCache cache(cfg);
+        auto err = cache.start();
+        ASSERT_EMPTY(err, "start");
+
+        // Access socket should NOT exist
+        auto access_sock = cfg.state_dir / "access.sock";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        ASSERT_TRUE(!fs::exists(access_sock), "access.sock should not exist when disabled");
+
+        // Access directory should NOT exist
+        auto access_dir = cfg.state_dir / "access";
+        ASSERT_TRUE(!fs::exists(access_dir), "access dir should not exist when disabled");
+
+        cache.stop();
+        cache.wait();
+        PASS();
+    }
+
+    // ---- access log deduplication ----
+    {
+        TEST(access_log_dedup);
+
+        fs::remove_all(root / "state");
+
+        CacheConfig cfg;
+        cfg.depot_path = depot;
+        cfg.primary.type = "nfs";
+        cfg.primary.params["path"] = storage.string();
+        cfg.state_dir = root / "state";
+        cfg.stats_interval_secs = 0;
+        cfg.max_cache_bytes = 1ULL * 1024 * 1024 * 1024;
+        cfg.eviction_low_watermark = 800ULL * 1024 * 1024;
+        cfg.access_log_enabled = true;
+        cfg.access_batch_size = 10;
+        cfg.access_flush_interval_secs = 1;
+        cfg.apply_defaults();
+
+        DepotCache cache(cfg);
+        auto err = cache.start();
+        ASSERT_EMPTY(err, "start");
+
+        auto access_sock = cfg.state_dir / "access.sock";
+        bool sock_ready = wait_for([&]{ return fs::exists(access_sock); }, 3000);
+        ASSERT_TRUE(sock_ready, "access.sock should exist");
+
+        // Send the same file multiple times
+        std::string events = "same/file.txt\nsame/file.txt\nsame/file.txt\n";
+        send_access_events(access_sock, events);
+
+        // Use daemon's own access_db_entries() to avoid opening a second env
+        // on the same directory (which corrupts the shared LMDB lock file)
+        bool flushed = wait_for([&]{
+            return cache.access_db_entries() >= 1;
+        }, 5000);
+        ASSERT_TRUE(flushed, "at least one entry should be written");
+
+        // Should only have 1 entry (deduplicated)
+        ASSERT_EQ(cache.access_db_entries(), (uint64_t)1, "duplicate paths should be deduplicated");
+
+        cache.stop();
+        cache.wait();
+        PASS();
+    }
+
+    // Clean up
+    fs::remove_all(root);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Access tool tests
+// ---------------------------------------------------------------------------
+
+/// Helper: write entries directly to an access LMDB for tool testing.
+static void populate_access_db(const fs::path& access_dir,
+                                const std::vector<std::pair<std::string, uint64_t>>& entries) {
+    fs::create_directories(access_dir);
+
+    MDB_env* env = nullptr;
+    mdb_env_create(&env);
+    mdb_env_set_mapsize(env, 1ULL * 1024 * 1024 * 1024);
+    mdb_env_open(env, access_dir.c_str(), 0, 0664);
+
+    MDB_txn* txn = nullptr;
+    mdb_txn_begin(env, nullptr, 0, &txn);
+
+    MDB_dbi dbi;
+    mdb_dbi_open(txn, nullptr, MDB_CREATE, &dbi);
+
+    for (auto& [path, ts] : entries) {
+        uint64_t le_ts = ts;
+        MDB_val k = {path.size(), const_cast<char*>(path.data())};
+        MDB_val v = {sizeof(le_ts), &le_ts};
+        mdb_put(txn, dbi, &k, &v, 0);
+    }
+
+    mdb_txn_commit(txn);
+    mdb_env_close(env);
+}
+
+static void test_access_tool() {
+    std::cout << "\n=== Access tool ===" << std::endl;
+
+    auto root = make_temp_dir("p4cache-atool");
+    auto access_dir = root / "access";
+
+    // Populate a test database
+    auto now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    populate_access_db(access_dir, {
+        {"dir1/file1.txt", now},
+        {"dir1/file2.txt", now - 86400},     // 1 day ago
+        {"dir2/file3.txt", now - 604800},     // 7 days ago
+        {"dir2/sub/file4.txt", now - 2592000}, // 30 days ago
+        {"other/file5.txt", now},
+    });
+
+    // ---- stat ----
+    {
+        TEST(access_tool_stat);
+        auto count = access_db_count(access_dir);
+        ASSERT_EQ(count, (size_t)5, "should have 5 entries");
+        PASS();
+    }
+
+    // ---- get ----
+    {
+        TEST(access_tool_get);
+        uint64_t ts = 0;
+        int rc = access_db_get(access_dir, "dir1/file1.txt", ts);
+        ASSERT_TRUE(rc == 0, "should find dir1/file1.txt");
+        ASSERT_EQ(ts, now, "timestamp should match");
+
+        rc = access_db_get(access_dir, "nonexistent.txt", ts);
+        ASSERT_TRUE(rc == MDB_NOTFOUND, "nonexistent should return NOTFOUND");
+        PASS();
+    }
+
+    // ---- prefix ----
+    {
+        TEST(access_tool_prefix);
+        // Open DB and do a prefix scan like the tool would
+        MDB_env* env = nullptr;
+        mdb_env_create(&env);
+        mdb_env_set_mapsize(env, 1ULL * 1024 * 1024 * 1024);
+        mdb_env_open(env, access_dir.c_str(), MDB_RDONLY, 0664);
+
+        MDB_txn* txn = nullptr;
+        mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
+
+        MDB_dbi dbi;
+        mdb_dbi_open(txn, nullptr, 0, &dbi);
+
+        MDB_cursor* cursor = nullptr;
+        mdb_cursor_open(txn, dbi, &cursor);
+
+        std::string prefix = "dir2/";
+        MDB_val k = {prefix.size(), const_cast<char*>(prefix.data())};
+        MDB_val v;
+        std::vector<std::string> results;
+
+        int rc = mdb_cursor_get(cursor, &k, &v, MDB_SET_RANGE);
+        while (rc == 0) {
+            std::string path(static_cast<const char*>(k.mv_data), k.mv_size);
+            if (path.compare(0, prefix.size(), prefix) != 0) break;
+            results.push_back(path);
+            rc = mdb_cursor_get(cursor, &k, &v, MDB_NEXT);
+        }
+
+        mdb_cursor_close(cursor);
+        mdb_txn_abort(txn);
+        mdb_env_close(env);
+
+        ASSERT_EQ(results.size(), (size_t)2, "dir2/ prefix should match 2 entries");
+        PASS();
+    }
+
+    // ---- stale ----
+    {
+        TEST(access_tool_stale);
+        // Scan for entries older than 2 days
+        uint64_t threshold = now - 2 * 86400;
+
+        MDB_env* env = nullptr;
+        mdb_env_create(&env);
+        mdb_env_set_mapsize(env, 1ULL * 1024 * 1024 * 1024);
+        mdb_env_open(env, access_dir.c_str(), MDB_RDONLY, 0664);
+
+        MDB_txn* txn = nullptr;
+        mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
+
+        MDB_dbi dbi;
+        mdb_dbi_open(txn, nullptr, 0, &dbi);
+
+        MDB_cursor* cursor = nullptr;
+        mdb_cursor_open(txn, dbi, &cursor);
+
+        MDB_val k, v;
+        std::vector<std::string> stale;
+
+        int rc2 = mdb_cursor_get(cursor, &k, &v, MDB_FIRST);
+        while (rc2 == 0) {
+            if (v.mv_size >= 8) {
+                uint64_t ts;
+                memcpy(&ts, v.mv_data, sizeof(ts));
+                if (ts < threshold) {
+                    stale.emplace_back(static_cast<const char*>(k.mv_data), k.mv_size);
+                }
+            }
+            rc2 = mdb_cursor_get(cursor, &k, &v, MDB_NEXT);
+        }
+
+        mdb_cursor_close(cursor);
+        mdb_txn_abort(txn);
+        mdb_env_close(env);
+
+        // dir2/file3.txt (7 days ago) and dir2/sub/file4.txt (30 days ago) should be stale
+        ASSERT_EQ(stale.size(), (size_t)2, "should have 2 stale entries");
+        PASS();
+    }
+
+    fs::remove_all(root);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Azure key sanitization tests
 // ---------------------------------------------------------------------------
 
 static size_t count_segments(const std::string& s) {
@@ -1128,7 +1575,7 @@ static void test_azure_key_sanitization() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Metrics tests
+// 9. Metrics tests
 // ---------------------------------------------------------------------------
 
 static void test_metrics() {
@@ -1290,6 +1737,8 @@ int main() {
     test_config_json();
     test_config_defaults_and_validation();
     test_depot_cache_integration();
+    test_access_log();
+    test_access_tool();
     test_azure_key_sanitization();
     test_metrics();
 

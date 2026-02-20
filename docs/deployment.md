@@ -18,6 +18,7 @@ cd build && cmake .. && make -j8
 
 # Install binaries
 sudo install -m 755 build/p4-cache /usr/local/bin/
+sudo install -m 755 build/p4-cache-access /usr/local/bin/
 sudo install -m 755 build/libp4shim.so /usr/local/lib/
 
 # Grant fanotify capability (avoids running as root)
@@ -275,9 +276,9 @@ cat /var/lib/node_exporter/textfile/p4cache.prom
 
 | Type | Metrics |
 |------|---------|
-| Counters | `p4cache_uploads_total{result}`, `p4cache_upload_bytes_total`, `p4cache_restores_total{result}`, `p4cache_restore_bytes_total`, `p4cache_restores_secondary_total`, `p4cache_evictions_total`, `p4cache_eviction_bytes_total`, `p4cache_shim_requests_total{result}`, `p4cache_watcher_events_total{type}` |
-| Gauges | `p4cache_files_dirty`, `p4cache_files_uploading`, `p4cache_files_clean`, `p4cache_files_total`, `p4cache_cache_bytes`, `p4cache_cache_max_bytes`, `p4cache_upload_queue_pending`, `p4cache_restore_queue_pending` |
-| Histograms | `p4cache_upload_duration_seconds`, `p4cache_restore_duration_seconds`, `p4cache_eviction_batch_duration_seconds`, `p4cache_shim_request_duration_seconds` |
+| Counters | `p4cache_uploads_total{result}`, `p4cache_upload_bytes_total`, `p4cache_restores_total{result}`, `p4cache_restore_bytes_total`, `p4cache_restores_secondary_total`, `p4cache_evictions_total`, `p4cache_eviction_bytes_total`, `p4cache_shim_requests_total{result}`, `p4cache_watcher_events_total{type}`, `p4cache_access_events_total`, `p4cache_access_batches_total` |
+| Gauges | `p4cache_files_dirty`, `p4cache_files_uploading`, `p4cache_files_clean`, `p4cache_files_total`, `p4cache_cache_bytes`, `p4cache_cache_max_bytes`, `p4cache_upload_queue_pending`, `p4cache_restore_queue_pending`, `p4cache_access_db_entries` |
+| Histograms | `p4cache_upload_duration_seconds`, `p4cache_restore_duration_seconds`, `p4cache_eviction_batch_duration_seconds`, `p4cache_shim_request_duration_seconds`, `p4cache_access_batch_duration_seconds` |
 
 All metrics carry constant labels: `depot` (depot path) and `mode` (`readwrite` or `readonly`).
 
@@ -327,6 +328,21 @@ mdb_dump -s files /mnt/nvme/depot/.p4cache/manifest/
 mdb_stat -e /mnt/nvme/depot/.p4cache/manifest/
 ```
 
+### Access Log Inspection
+
+Query the access log database using `p4-cache-access`:
+
+```bash
+# Database statistics
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access stat
+
+# Check when a specific file was last accessed
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access get path/to/file.c
+
+# Find files not accessed in 30 days (candidates for archival)
+p4-cache-access --db /mnt/nvme/depot/.p4cache/access stale --before 30d --limit 1000
+```
+
 ## Scaling
 
 ### Billion-File Depots
@@ -348,6 +364,21 @@ The NVMe cache should be large enough to hold your working set — the files act
 | Small depot (< 100 GB) | 1.5x total depot size |
 | Medium depot, active development | 30-50% of total depot size |
 | Large depot (PB-scale), CI workloads | 30-60 TB NVMe, `--skip-startup-scan` |
+
+### Access Log Disk Space
+
+The access log stores one entry per unique depot file ever accessed. Each entry is ~104 bytes (path key + 8-byte timestamp + LMDB overhead).
+
+| Unique files tracked | Approximate DB size |
+|---------------------|-------------------|
+| 10 million | ~1 GB |
+| 100 million | ~10 GB |
+| 1 billion | ~100 GB |
+| 2 billion | ~250 GB |
+
+The default LMDB map size is 512 GB (virtual address space only; actual disk usage grows on demand). For very large depots, increase with `--access-mapsize-gb`.
+
+The access LMDB directory is at `<depot>/.p4cache/access/`. To reclaim space, stop the daemon and delete the directory; it will be recreated on restart.
 
 ### Sizing the Watermarks
 

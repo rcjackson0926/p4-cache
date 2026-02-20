@@ -223,6 +223,16 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
             auto* v = next_arg(i, "--metrics-interval");
             if (!v) return std::nullopt;
             config.metrics_interval_secs = std::stoull(v);
+        } else if (arg == "--no-access-log") {
+            config.access_log_enabled = false;
+        } else if (arg == "--access-batch-size") {
+            auto* v = next_arg(i, "--access-batch-size");
+            if (!v) return std::nullopt;
+            config.access_batch_size = std::stoull(v);
+        } else if (arg == "--access-mapsize-gb") {
+            auto* v = next_arg(i, "--access-mapsize-gb");
+            if (!v) return std::nullopt;
+            config.access_mapsize_gb = std::stoull(v);
         } else if (arg == "--help" || arg == "-h") {
             std::cerr <<
                 "Usage: p4-cache --depot-path <path> --primary-type <s3|azure|gcs|nfs> [options]\n"
@@ -270,6 +280,11 @@ std::optional<CacheConfig> CacheConfig::from_args(int argc, char* argv[]) {
                 "  --stats-interval <secs>          Stats reporting interval (default: 60)\n"
                 "  --metrics-file <path>            Prometheus .prom file for node_exporter textfile collector\n"
                 "  --metrics-interval <secs>        Metrics write interval (default: 15)\n"
+                "\n"
+                "Access log:\n"
+                "  --no-access-log                  Disable access log (default: enabled)\n"
+                "  --access-batch-size <N>          Access log batch size (default: 10000)\n"
+                "  --access-mapsize-gb <N>          Access log LMDB map size in GB (default: 512)\n"
                 "  --help                           Show this help\n";
             return std::nullopt;
         } else {
@@ -319,6 +334,9 @@ bool CacheConfig::load_json(const std::filesystem::path& path) {
         if (j.contains("stats_interval")) stats_interval_secs = j["stats_interval"].get<size_t>();
         if (j.contains("metrics_file")) metrics_file = j["metrics_file"].get<std::string>();
         if (j.contains("metrics_interval")) metrics_interval_secs = j["metrics_interval"].get<size_t>();
+        if (j.contains("access_log_enabled")) access_log_enabled = j["access_log_enabled"].get<bool>();
+        if (j.contains("access_batch_size")) access_batch_size = j["access_batch_size"].get<size_t>();
+        if (j.contains("access_mapsize_gb")) access_mapsize_gb = j["access_mapsize_gb"].get<uint64_t>();
 
         // Parse primary backend
         if (j.contains("primary") && j["primary"].is_object()) {
