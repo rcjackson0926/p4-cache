@@ -36,7 +36,7 @@ if [[ "${1:-}" == "--rebuild" ]]; then
 fi
 
 # --- Verify binaries exist ---
-for bin in "$BUILD_DIR/p4-cache" "$BUILD_DIR/libp4shim.so"; do
+for bin in "$BUILD_DIR/p4-cache" "$BUILD_DIR/p4-cache-access" "$BUILD_DIR/libp4shim.so"; do
     if [[ ! -f "$bin" ]]; then
         echo "Error: $bin not found. Run with --rebuild or build first." >&2
         exit 1
@@ -46,8 +46,9 @@ done
 # --- Populate package tree ---
 
 # Binaries
-install -Dm755 "$BUILD_DIR/p4-cache"     "$PKG_DIR/usr/local/bin/p4-cache"
-install -Dm755 "$BUILD_DIR/libp4shim.so"  "$PKG_DIR/usr/local/lib/libp4shim.so"
+install -Dm755 "$BUILD_DIR/p4-cache"        "$PKG_DIR/usr/local/bin/p4-cache"
+install -Dm755 "$BUILD_DIR/p4-cache-access" "$PKG_DIR/usr/local/bin/p4-cache-access"
+install -Dm755 "$BUILD_DIR/libp4shim.so"    "$PKG_DIR/usr/local/lib/libp4shim.so"
 
 # systemd service
 install -Dm644 /dev/stdin "$PKG_DIR/lib/systemd/system/p4-cache.service" <<'SERVICE'
@@ -122,6 +123,7 @@ Description: NVMe depot acceleration daemon for Perforce
  .
  Package contents:
   - p4-cache: the cache daemon
+  - p4-cache-access: access log query tool
   - libp4shim.so: LD_PRELOAD library for P4d cold-file interception
 EOF
 
